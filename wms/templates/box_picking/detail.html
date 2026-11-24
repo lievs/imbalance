@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}{{ task.number }} — подбор коробов{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('box_picking.list_tasks') }}">&larr; Задания на подбор</a></p>
+<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
+  <div>
+    <h3 class="mb-1">{{ task.number }} · {{ task.title or 'Подбор коробов' }}</h3>
+    <div class="text-muted">Склад: <strong>{{ task.warehouse.name }}</strong> · Исполнитель: {{ task.assigned_to.display_name() if task.assigned_to else 'не назначен' }}</div>
+  </div>
+  <span class="badge fs-6 {{ 'bg-success' if task.status == 'completed' else 'bg-primary' if task.status == 'in_progress' else 'bg-secondary' }}">{{ status_labels[task.status] }}</span>
+</div>
+
+{% if task.status != 'completed' %}
+<div class="card p-3 mb-3 border-primary">
+  <form method="post" action="{{ url_for('box_picking.scan', task_id=task.id) }}" class="row g-2 align-items-end">
+    <div class="col-md-8">
+      <label class="form-label fw-semibold">Сканировать подобранный короб</label>
+      <input id="boxScan" name="box_code" class="form-control form-control-lg" autocomplete="off" autofocus required placeholder="Штрихкод короба">
+    </div>
+    <div class="col-md-4"><button class="btn btn-success btn-lg w-100">✓ Подобран</button></div>
+  </form>
+</div>
+{% endif %}
+
+<div class="d-flex justify-content-between align-items-center mb-2">
+  <h5 class="mb-0">Короба: {{ task.picked_count() }} из {{ task.total_count() }}</h5>
+</div>
+<div class="table-responsive">
+<table class="table table-hover align-middle">
+  <thead><tr><th>Статус</th><th>Короб</th><th>Склад</th><th>Размещение</th><th>Состав</th><th>Подобрал</th><th></th></tr></thead>
+  <tbody>
+  {% for line in lines %}
+    <tr class="{{ 'table-success' if line.picked_at else '' }}">
+      <td>{{ '✅' if line.picked_at else '⬜' }}</td>
+      <td><a href="{{ url_for('boxes.detail', box_id=line.box.id) }}" class="fw-semibold">{{ line.box.box_number }}</a></td>
+      <td>{{ line.box.warehouse.name }}</td>
+      <td>
+        {% if line.box.location_label() %}<span class="badge bg-info text-dark fs-6">{{ line.box.location_label() }}</span>
+        {% else %}<span class="badge bg-warning text-dark">Не размещен</span>{% endif %}
+      </td>
+      <td>{{ line.box.total_qty()|qty }} шт.</td>
+      <td>{% if line.picked_at %}{{ line.picked_by.display_name() if line.picked_by else '—' }}<br><small class="text-muted">{{ line.picked_at.strftime('%d.%m.%Y %H:%M') }}</small>{% else %}—{% endif %}</td>
+      <td>
+        {% if task.status != 'completed' and (current_user.is_admin or task.created_by_id == current_user.id) %}
+        <form method="post" action="{{ url_for('box_picking.remove_line', task_id=task.id, line_id=line.id) }}" onsubmit="return confirm('Удалить короб из задания?')">
+          <button class="btn btn-sm btn-outline-danger">Удалить</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% else %}<tr><td colspan="7" class="text-center text-muted py-4">Короба еще не добавлены</td></tr>{% endfor %}
+  </tbody>
+</table>
+</div>
+
+{% if task.status != 'completed' %}
+<form method="post" action="{{ url_for('box_picking.add_boxes', task_id=task.id) }}" class="card p-3 mt-3">
+  <label class="form-label fw-semibold">Добавить короба в задание</label>
+  <div class="input-group">
+    <textarea name="box_codes" class="form-control" rows="2" placeholder="Номера через пробел, запятую или с новой строки" required></textarea>
+    <button class="btn btn-outline-primary">Добавить</button>
+  </div>
+</form>
+{% endif %}
+
+{% if current_user.is_admin %}
+<div class="d-flex gap-2 mt-4">
+  {% if task.status == 'completed' %}<form method="post" action="{{ url_for('box_picking.reopen', task_id=task.id) }}"><button class="btn btn-outline-warning">Открыть заново</button></form>{% endif %}
+  <form method="post" action="{{ url_for('box_picking.delete_task', task_id=task.id) }}" onsubmit="return confirm('Удалить задание целиком?')"><button class="btn btn-outline-danger">Удалить задание</button></form>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,222 @@
+{% extends "base.html" %}
+{% block title %}Размещение{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4">
+  <h3 class="mb-0">Размещение товара</h3>
+</div>
+
+{% set hint_stock = "Принятый товар, который еще не упакован в короба и не расставлен по ячейкам." %}
+{% set hint_open_boxes = "Уже упакованы, но не расставлены (например, приехали перемещением). Разместите сразу здесь." %}
+{% set hint_rows = "Для помещений без ячеек — короб кладется прямо в ряд, без ограничения по вместимости." %}
+
+<ul class="nav nav-tabs mb-3" id="placementTabs" role="tablist">
+  <li class="nav-item" role="presentation">
+    <button class="nav-link active" id="tab-item-btn" data-bs-toggle="tab" data-bs-target="#tab-item" type="button" role="tab">📦 Разместить товар</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="tab-box-btn" data-bs-toggle="tab" data-bs-target="#tab-box" type="button" role="tab">🗄 Разместить короб</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="tab-row-btn" data-bs-toggle="tab" data-bs-target="#tab-row" type="button" role="tab">🧱 Размещение в ряды</button>
+  </li>
+</ul>
+
+<div class="tab-content mb-4">
+  <div class="tab-pane fade show active" id="tab-item" role="tabpanel">
+    <div class="card p-3">
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h5 class="d-flex align-items-center gap-2 mb-0">
+          Неразмещенный остаток по складам
+          <button type="button" class="hint-icon d-md-none" data-bs-toggle="popover" data-bs-trigger="focus"
+                  data-bs-placement="bottom" data-bs-content="{{ hint_stock }}" aria-label="Подсказка">?</button>
+        </h5>
+        <div class="d-flex gap-2">
+          <a class="btn btn-primary btn-sm" href="{{ url_for('placement.new_document') }}">➕ Новое размещение</a>
+          {% if current_user.is_admin %}
+          <form method="post" action="{{ url_for('placement.clear_unplaced_stock') }}" class="d-flex gap-1"
+                onsubmit="return confirm('Обнулить весь неразмещенный остаток выбранного склада? Это изменит учетные остатки.');">
+            <select name="warehouse_id" class="form-select form-select-sm" required>
+              <option value="">Склад...</option>
+              {% for wh in warehouses %}<option value="{{ wh.id }}">{{ wh.name }}</option>{% endfor %}
+            </select>
+            <button class="btn btn-sm btn-outline-danger" type="submit">Очистить список</button>
+          </form>
+          {% endif %}
+        </div>
+      </div>
+      <p class="text-muted small d-none d-md-block">{{ hint_stock }}</p>
+      <table class="table table-sm table-mobile-compact">
+        <thead><tr><th>Склад</th><th>Штрихкод</th><th>Наименование</th><th>Размер</th><th>Начальный остаток</th><th>Размещено</th><th>Кол-во</th><th>Поступление</th></tr></thead>
+        <tbody>
+        {% for row in stock_rows %}
+          <tr>
+            <td>{{ row.warehouse.name }}</td>
+            <td>{{ row.nomenclature.barcode }}</td>
+            <td>{{ row.nomenclature.name }}</td>
+            <td>{{ row.nomenclature.size or '' }}</td>
+            <td>{{ row.initial_qty() if row.initial_qty() is not none else '—' }}</td>
+            <td>{{ row.placed_qty() if row.placed_qty() is not none else '—' }}</td>
+            <td>{{ row.qty }} {{ row.nomenclature.unit }}</td>
+            <td class="small text-muted">
+              {% for lot in row.active_lots() %}
+                {{ lot.qty_remaining | int if lot.qty_remaining == lot.qty_remaining | int else lot.qty_remaining }} шт
+                {%- if lot.supplier_name %} — {{ lot.supplier_name }}{% endif -%}
+                {%- if lot.order_number %} (№{{ lot.order_number }}){% endif %}{% if not loop.last %}<br>{% endif %}
+              {% else %}—{% endfor %}
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="8" class="text-muted">Неразмещенных остатков нет</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% if stock_pagination.pages > 1 %}
+      <div class="d-flex justify-content-between align-items-center mt-2">
+        <div class="text-muted small">Стр. {{ stock_pagination.page }} из {{ stock_pagination.pages }} · всего строк: {{ stock_pagination.total }}</div>
+        <div class="d-flex gap-2">
+          {% if stock_pagination.has_prev %}
+            <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('placement.list_documents', stock_page=stock_pagination.prev_num, boxes_page=boxes_pagination.page) }}#tab-item">&larr; Назад</a>
+          {% endif %}
+          {% if stock_pagination.has_next %}
+            <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('placement.list_documents', stock_page=stock_pagination.next_num, boxes_page=boxes_pagination.page) }}#tab-item">Вперед &rarr;</a>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="tab-pane fade" id="tab-box" role="tabpanel">
+    <div class="card p-3">
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h5 class="d-flex align-items-center gap-2 mb-0">
+          Короба без ячейки
+          <button type="button" class="hint-icon d-md-none" data-bs-toggle="popover" data-bs-trigger="focus"
+                  data-bs-placement="bottom" data-bs-content="{{ hint_open_boxes }}" aria-label="Подсказка">?</button>
+        </h5>
+        <div class="d-flex flex-wrap gap-2">
+          <a class="btn btn-outline-primary btn-sm" href="{{ url_for('placement.scan_box') }}">📷 Сканировать короб</a>
+          <a class="btn btn-outline-primary btn-sm" href="{{ url_for('placement.scan_cell') }}">📍 Сканировать ячейку</a>
+        </div>
+      </div>
+      <p class="text-muted small d-none d-md-block">{{ hint_open_boxes }}</p>
+      <table class="table table-sm table-mobile-compact">
+        <thead><tr><th>Короб</th><th>Склад</th><th>Рекомендация</th><th>Разместить</th></tr></thead>
+        <tbody>
+        {% for box in open_boxes %}
+          {% set suggestion = cell_suggestions.get(box.id) %}
+          <tr>
+            <td>{{ box.box_number }}</td>
+            <td>{{ box.warehouse.name }}</td>
+            <td class="text-muted small">{% if suggestion %}{{ suggestion.cell.code }} — {{ suggestion.reason }}{% endif %}</td>
+            <td>
+              <form method="post" action="{{ url_for('placement.place_box_standalone', box_id=box.id) }}" class="d-flex gap-1">
+                <input type="hidden" name="next" value="{{ url_for('placement.list_documents', boxes_page=boxes_pagination.page) }}">
+                <input type="text" name="cell_code" value="{{ suggestion.cell.code if suggestion else '' }}" class="form-control form-control-sm" placeholder="Код ячейки или ряда" required style="max-width:140px">
+                <button type="submit" class="btn btn-sm btn-outline-primary">OK</button>
+              </form>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="4" class="text-muted">Все короба размещены</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% if boxes_pagination.pages > 1 %}
+      <div class="d-flex justify-content-between align-items-center mt-2">
+        <div class="text-muted small">Стр. {{ boxes_pagination.page }} из {{ boxes_pagination.pages }} · всего коробов: {{ boxes_pagination.total }}</div>
+        <div class="d-flex gap-2">
+          {% if boxes_pagination.has_prev %}
+            <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('placement.list_documents', boxes_page=boxes_pagination.prev_num, stock_page=stock_pagination.page) }}#tab-box">&larr; Назад</a>
+          {% endif %}
+          {% if boxes_pagination.has_next %}
+            <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('placement.list_documents', boxes_page=boxes_pagination.next_num, stock_page=stock_pagination.page) }}#tab-box">Вперед &rarr;</a>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="tab-pane fade" id="tab-row" role="tabpanel">
+    <div class="card p-3">
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h5 class="d-flex align-items-center gap-2 mb-0">
+          Ряды склада
+          <button type="button" class="hint-icon d-md-none" data-bs-toggle="popover" data-bs-trigger="focus"
+                  data-bs-placement="bottom" data-bs-content="{{ hint_rows }}" aria-label="Подсказка">?</button>
+        </h5>
+      </div>
+      <p class="text-muted small d-none d-md-block">{{ hint_rows }}</p>
+      <table class="table table-sm table-mobile-compact">
+        <thead><tr><th>Склад</th><th>Ряд</th><th>Коробов в ряду</th><th></th></tr></thead>
+        <tbody>
+        {% for zone in zones %}
+          <tr>
+            <td>{{ zone.warehouse.name }}</td>
+            <td>{{ zone.code }}{% if zone.name %} — {{ zone.name }}{% endif %}</td>
+            <td>{{ zone_row_box_counts.get(zone.id, 0) }}</td>
+            <td><a class="btn btn-sm btn-outline-primary" href="{{ url_for('placement.scan_row', zone_id=zone.id) }}">📷 Разместить в ряд</a></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="4" class="text-muted">Рядов пока не заведено — создайте ряд на странице склада («Ячейки»)</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3">
+  <h5>Документы размещения</h5>
+  <table class="table d-none d-md-table">
+    <thead><tr><th>Номер</th><th>Дата</th><th>Склад</th><th>Автор</th><th>Статус</th><th></th></tr></thead>
+    <tbody>
+    {% for d in documents %}
+      <tr>
+        <td>{{ d.number }}</td>
+        <td>{{ (d.created_at|msk).strftime('%d.%m.%Y %H:%M') }}</td>
+        <td>{{ d.warehouse.name }}</td>
+        <td>{{ d.created_by.display_name() if d.created_by else '' }}</td>
+        <td><span class="badge badge-status-{{ d.status }}">{{ 'В работе' if d.status == 'draft' else 'Завершено' }}</span></td>
+        <td>
+          <a href="{{ url_for('placement.detail', doc_id=d.id) }}">Открыть</a>
+          · <a href="{{ url_for('placement.export_document', doc_id=d.id) }}">Excel</a>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="text-muted">Документов еще нет</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="list-group d-md-none">
+    {% for d in documents %}
+      <div class="list-group-item py-2 px-2">
+        <div class="d-flex justify-content-between align-items-center gap-2">
+          <a href="{{ url_for('placement.detail', doc_id=d.id) }}" class="fw-bold text-decoration-none">{{ d.number }}</a>
+          <span class="badge badge-status-{{ d.status }}">{{ 'В работе' if d.status == 'draft' else 'Завершено' }}</span>
+        </div>
+        <div class="small text-muted">{{ d.warehouse.name }}</div>
+        <div class="small text-muted">{{ (d.created_at|msk).strftime('%d.%m.%Y') }}{% if d.created_by %} · Автор: {{ d.created_by.display_name() }}{% endif %}</div>
+      </div>
+    {% else %}
+      <div class="list-group-item text-muted">Документов еще нет</div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Если пришли по ссылке с #tab-box (например, "Назад"/"Вперед" по
+  // страницам коробов) — открываем вкладку "Разместить короб" сразу,
+  // а не только "Разместить товар" по умолчанию.
+  if (window.location.hash === "#tab-box") {
+    const boxTabBtn = document.getElementById("tab-box-btn");
+    if (boxTabBtn && window.bootstrap) {
+      new bootstrap.Tab(boxTabBtn).show();
+    }
+  }
+</script>
+{% endblock %}

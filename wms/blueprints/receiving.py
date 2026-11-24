@@ -1,0 +1,1900 @@
+import io
+import json
+import secrets
+from datetime import datetime, timedelta
+
+from flask import (
+    Blueprint,
+    Response,
+    abort,
+    current_app,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    url_for,
+)
+from flask_login import current_user
+from sqlalchemy import and_, func, or_
+from sqlalchemy.exc import IntegrityError
+
+from ..extensions import db
+from ..models import (
+    AppSetting,
+    Box,
+    BoxItem,
+    Nomenclature,
+    PHYSICAL_STOCK_WAREHOUSE_NAMES,
+    PlacementLine,
+    ReceivingDocument,
+    ReceivingLine,
+    Supplier,
+    SupplierReturn,
+    UnplacedStock,
+    UnplacedStockLot,
+    User,
+    Warehouse,
+)
+from ..utils.document_access import get_owned_or_404
+from ..utils.excel_io import export_receiving_to_excel, timestamp_for_filename
+from ..utils.http import content_disposition
+from ..utils.numbering import next_number
+from ..utils.receiving_invoice_import import InvoiceParseError, parse_invoice
+from ..utils.timezone import to_moscow
+from ..utils.work_log import log_pack
+
+bp = Blueprint("receiving", __name__)
+
+
+@bp.before_request
+def _restrict_document_access():
+    document_id = (request.view_args or {}).get("doc_id")
+    if document_id is None:
+        return None
+
+    doc = ReceivingDocument.query.get_or_404(document_id)
+    if current_user.is_fulfillment_only():
+        # Фулфилмент ведет любую приемку своего склада, не только
+        # созданную лично им (на складе может работать несколько человек) —
+        # но ничего по другим складам (см. чат).
+        if doc.warehouse_id != current_user.warehouse_id:
+            abort(404)
+        return None
+    if current_user.can_view_invoice_receivings() and doc.is_from_invoice_import():
+        # Раньше это правило действовало только на GET — право "видит все
+        # приемки по накладным" выдается приемщику/зав. складом именно
+        # чтобы они ВЕЛИ чужие приемки по накладным целиком (отправка на
+        # пересчет/разбраковку, ввод количества и т.п.), а не только
+        # смотрели на них. Без этого POST send-to-recount и все остальные
+        # изменяющие действия на чужой приемке по накладной падали в 404
+        # для всех, кроме автора и админа (см. get_owned_or_404 ниже) —
+        # даже у тех, у кого есть это право.
+        return None
+    get_owned_or_404(ReceivingDocument, document_id)
+    return None
+
+
+def _visible_receiving_query():
+    """Приемки, видимые пользователю в списке."""
+    query = ReceivingDocument.query
+    if current_user.is_admin:
+        return query
+    if current_user.is_fulfillment_only():
+        # Весь свой склад, а не только документы, созданные лично этим
+        # пользователем (см. чат).
+        return query.filter(ReceivingDocument.warehouse_id == current_user.warehouse_id)
+    if current_user.can_view_invoice_receivings():
+        return query.filter(
+            or_(
+                ReceivingDocument.created_by_id == current_user.id,
+                ReceivingDocument.invoice_file_name.isnot(None),
+            )
+        )
+    return query.filter(ReceivingDocument.created_by_id == current_user.id)
+
+
+def _receiving_warehouses():
+    """В приемке доступны только согласованные физические склады.
+    Фулфилмент (см. чат) видит и может создавать приемки только на своем
+    складе — остальные физические склады ему не предлагаются."""
+    if current_user.is_fulfillment_only():
+        return [current_user.warehouse] if current_user.warehouse and current_user.warehouse.is_active else []
+    warehouses = (
+        Warehouse.query.filter(
+            Warehouse.is_active.is_(True),
+            func.lower(func.trim(Warehouse.name)).in_(PHYSICAL_STOCK_WAREHOUSE_NAMES),
+        )
+        .order_by(Warehouse.code)
+        .all()
+    )
+    if warehouses:
+        return warehouses
+    # Обратная совместимость для старой базы, где физические склады могли
+    # называться иначе: до переименования берем первые три по коду,
+    # но склады-городá маркетплейсов в приемку никогда не попадают.
+    return (
+        Warehouse.query.filter_by(is_active=True, marketplace=None)
+        .order_by(Warehouse.code)
+        .limit(3)
+        .all()
+    )
+
+
+def _receiving_warehouse_or_none(warehouse_id):
+    if not warehouse_id:
+        return None
+    return next((wh for wh in _receiving_warehouses() if wh.id == warehouse_id), None)
+
+
+def _next_redirect(doc_id):
+    """Некоторые действия (переходы статуса, разбраковка) доступны и с
+    обычной страницы приемки, и с мобильной сверки по накладной (см.
+    add_line, тот же прием с next=confirm) — возвращаемся туда же, откуда
+    пришли, вместо того чтобы всегда уводить на десктопную страницу."""
+    if request.form.get("next") == "confirm":
+        return redirect(url_for("receiving.confirm_invoice", doc_id=doc_id))
+    return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+
+def _receiving_search_token_condition(token):
+    """Условие для ОДНОГО слова поискового запроса — совпадение в любом из
+    полей (номер, поставщик — как свободный текст, так и из справочника,
+    № заказа, склад, автор). Несколько слов объединяются через И (см.
+    _apply_receiving_search) — как в поиске по перемещениям (см. чат и
+    movement._movement_search_token_condition)."""
+    like = f"%{token}%"
+    return or_(
+        ReceivingDocument.number.ilike(like),
+        ReceivingDocument.supplier.ilike(like),
+        ReceivingDocument.order_number.ilike(like),
+        ReceivingDocument.supplier_ref.has(
+            or_(Supplier.name.ilike(like), Supplier.inn.ilike(like))
+        ),
+        ReceivingDocument.warehouse.has(Warehouse.name.ilike(like)),
+        ReceivingDocument.created_by.has(
+            or_(User.username.ilike(like), User.full_name.ilike(like))
+        ),
+    )
+
+
+def _apply_receiving_search(query):
+    """Фильтрует запрос по поисковой строке q — разбивается по пробелам,
+    документ должен совпасть по КАЖДОМУ слову (не обязательно в одном и
+    том же поле, см. _receiving_search_token_condition), как поиск по
+    перемещениям (см. чат)."""
+    q = request.args.get("q", "").strip()
+    if not q:
+        return query
+    tokens = q.split()
+    return query.filter(
+        and_(*(_receiving_search_token_condition(token) for token in tokens))
+    )
+
+
+COLUMN_FILTER_KEYS = (
+    "f_number", "f_date", "f_warehouse", "f_supplier", "f_order", "f_author",
+    "f_status", "f_qty", "f_returns", "f_checked",
+)
+
+
+def _apply_column_filters(query):
+    """Поиск по каждой колонке списка приемок (строка фильтров под шапкой
+    таблицы). Все заполненные фильтры объединяются через И и работают
+    вместе с общим поиском q и галочками над таблицей."""
+    args = request.args
+
+    def text(key):
+        return args.get(key, "").strip()
+
+    if text("f_number"):
+        query = query.filter(ReceivingDocument.number.ilike(f"%{text('f_number')}%"))
+    if text("f_date"):
+        try:
+            day = datetime.strptime(text("f_date"), "%Y-%m-%d")
+        except ValueError:
+            day = None
+        if day is not None:
+            # день в московском времени -> диапазон в UTC (в БД хранится UTC)
+            start = day - timedelta(hours=3)
+            query = query.filter(
+                ReceivingDocument.created_at >= start,
+                ReceivingDocument.created_at < start + timedelta(days=1),
+            )
+    if text("f_warehouse"):
+        query = query.filter(
+            ReceivingDocument.warehouse.has(Warehouse.name.ilike(f"%{text('f_warehouse')}%"))
+        )
+    if text("f_supplier"):
+        like = f"%{text('f_supplier')}%"
+        query = query.filter(
+            or_(
+                ReceivingDocument.supplier.ilike(like),
+                ReceivingDocument.supplier_ref.has(Supplier.name.ilike(like)),
+            )
+        )
+    if text("f_order"):
+        query = query.filter(ReceivingDocument.order_number.ilike(f"%{text('f_order')}%"))
+    if text("f_author"):
+        like = f"%{text('f_author')}%"
+        query = query.filter(
+            ReceivingDocument.created_by.has(
+                or_(User.username.ilike(like), User.full_name.ilike(like))
+            )
+        )
+    if text("f_status") in ("draft", "recounting", "sorting", "completed"):
+        query = query.filter(ReceivingDocument.status == text("f_status"))
+    if text("f_qty"):
+        try:
+            wanted = float(text("f_qty").replace(",", "."))
+        except ValueError:
+            wanted = None
+        if wanted is not None:
+            matching = (
+                db.session.query(ReceivingLine.document_id)
+                .group_by(ReceivingLine.document_id)
+                .having(func.abs(func.sum(ReceivingLine.qty) - wanted) < 0.0005)
+            )
+            query = query.filter(ReceivingDocument.id.in_(matching))
+    returns = text("f_returns")
+    if returns in ("yes", "no"):
+        has_returns = ReceivingDocument.id.in_(db.session.query(SupplierReturn.receiving_document_id))
+        query = query.filter(has_returns if returns == "yes" else ~has_returns)
+    checked = text("f_checked")
+    if checked == "yes":
+        query = query.filter(ReceivingDocument.checked_in_1c_at.isnot(None))
+    elif checked == "no":
+        query = query.filter(ReceivingDocument.checked_in_1c_at.is_(None))
+    return query
+
+
+@bp.route("/")
+def list_documents():
+    # "Приемка по накладной" — документы, созданные загрузкой файла
+    # накладной (см. import_invoice_form): у них всегда проставлен
+    # supplier_id (найденный/заведенный в справочник поставщик), в отличие
+    # от ручного создания, где поставщик — просто свободный текст.
+    unfinished_only = request.args.get("unfinished") == "on"
+    invoice_only = request.args.get("invoice_only") == "on"
+    # «Приемки без накладных» — ручные приемки (поставщик не из справочника,
+    # накладная не загружалась), обратное к «Приемка по накладным».
+    no_invoice = request.args.get("no_invoice") == "on"
+    q = request.args.get("q", "").strip()
+    warehouse_id = request.args.get("warehouse_id", type=int)
+
+    query = _visible_receiving_query()
+    if unfinished_only:
+        query = query.filter(ReceivingDocument.status != "completed")
+    if invoice_only:
+        query = query.filter(ReceivingDocument.supplier_id.isnot(None))
+    if no_invoice:
+        query = query.filter(ReceivingDocument.supplier_id.is_(None))
+    query = _apply_receiving_search(query)
+    query = _apply_column_filters(query)
+    if warehouse_id:
+        query = query.filter(ReceivingDocument.warehouse_id == warehouse_id)
+
+    documents = query.order_by(ReceivingDocument.created_at.desc()).all()
+
+    # Возвраты и расхождения с накладной — одним batch-запросом сразу по
+    # всем документам страницы, чтобы подсветить их в списке (не заходя в
+    # каждый по отдельности), см. wms/templates/receiving/list.html.
+    doc_ids = [d.id for d in documents]
+    returns_count_by_doc = {}
+    mismatch_doc_ids = set()
+    total_qty_by_doc = {}
+    if doc_ids:
+        for doc_id, count in (
+            db.session.query(SupplierReturn.receiving_document_id, db.func.count(SupplierReturn.id))
+            .filter(SupplierReturn.receiving_document_id.in_(doc_ids))
+            .group_by(SupplierReturn.receiving_document_id)
+            .all()
+        ):
+            returns_count_by_doc[doc_id] = count
+        mismatch_doc_ids = {
+            row[0]
+            for row in db.session.query(ReceivingLine.document_id)
+            .filter(
+                ReceivingLine.document_id.in_(doc_ids),
+                ReceivingLine.expected_qty.isnot(None),
+                ReceivingLine.expected_qty != ReceivingLine.qty,
+            )
+            .distinct()
+            .all()
+        }
+        # удаленные строки «не привезли» — тоже расхождение с накладной
+        mismatch_doc_ids |= {d.id for d in documents if d.removed_zero_lines}
+        for doc_id, qty_sum in (
+            db.session.query(ReceivingLine.document_id, db.func.sum(ReceivingLine.qty))
+            .filter(ReceivingLine.document_id.in_(doc_ids))
+            .group_by(ReceivingLine.document_id)
+            .all()
+        ):
+            total_qty_by_doc[doc_id] = qty_sum or 0
+
+    return render_template(
+        "receiving/list.html",
+        documents=documents,
+        unfinished_only=unfinished_only,
+        invoice_only=invoice_only,
+        no_invoice=no_invoice,
+        filters={key: request.args.get(key, "").strip() for key in COLUMN_FILTER_KEYS},
+        q=q,
+        warehouse_id=warehouse_id,
+        warehouses=_receiving_warehouses(),
+        returns_count_by_doc=returns_count_by_doc,
+        mismatch_doc_ids=mismatch_doc_ids,
+        total_qty_by_doc=total_qty_by_doc,
+    )
+
+
+@bp.route("/counterparties")
+def counterparties():
+    """Справочник сопоставления контрагентов WMS с ИНН.
+
+    Отдельную копию данных не создаем: показываем Supplier, который реально
+    используется при загрузке накладной и выгрузке возвратов в 1С. Поэтому
+    исправление карточки по ИНН сразу видно и здесь, и в следующих обменах.
+    """
+    q = request.args.get("q", "").strip()
+    query = (
+        db.session.query(
+            Supplier,
+            func.count(ReceivingDocument.id).label("receiving_count"),
+            func.max(ReceivingDocument.created_at).label("last_receiving_at"),
+        )
+        .outerjoin(ReceivingDocument, ReceivingDocument.supplier_id == Supplier.id)
+        .group_by(Supplier.id)
+    )
+    if q:
+        like = f"%{q}%"
+        query = query.filter(
+            or_(
+                Supplier.name.ilike(like),
+                Supplier.inn.ilike(like),
+                Supplier.phone.ilike(like),
+            )
+        )
+
+    rows = query.order_by(Supplier.name, Supplier.id).all()
+    return render_template(
+        "receiving/counterparties.html",
+        rows=rows,
+        q=q,
+    )
+
+
+@bp.route("/<int:doc_id>/toggle-checked-in-1c", methods=["POST"])
+def toggle_checked_in_1c(doc_id):
+    """Ручная отметка "проверено в 1С" — просто галочка для контроля
+    бухгалтером (см. чат), никак не влияет на сам документ и не связана с
+    выгрузкой (см. ReceivingDocument.checked_in_1c_at). Отвечает JSON, а не
+    редиректом — в списке приемок эта галочка переключается через fetch(),
+    без перезагрузки страницы."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    doc.checked_in_1c_at = None if doc.checked_in_1c_at else datetime.utcnow()
+    db.session.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "checked": doc.checked_in_1c_at is not None,
+            "at": to_moscow(doc.checked_in_1c_at).strftime("%d.%m.%Y %H:%M")
+            if doc.checked_in_1c_at
+            else None,
+        }
+    )
+
+
+@bp.route("/returns")
+def returns_list():
+    """Возвраты поставщику (см. complete()/is_from_invoice_import) с
+    видимостью, что из них уже забрала 1С (synced_to_1c_at, см.
+    integration_1c.export_confirm), а что еще ждет выгрузки. Само
+    подтверждение выгрузки ставит только интеграция — здесь только для
+    чтения; ручное исключение из очереди (accounting_entered_at) делается
+    отдельно, на странице integration_1c.pending."""
+    unsynced_only = request.args.get("unsynced") == "on"
+
+    query = SupplierReturn.query
+    if not current_user.is_admin:
+        query = query.join(ReceivingDocument)
+        if current_user.can_view_invoice_receivings():
+            query = query.filter(
+                or_(
+                    ReceivingDocument.created_by_id == current_user.id,
+                    ReceivingDocument.invoice_file_name.isnot(None),
+                )
+            )
+        else:
+            query = query.filter(ReceivingDocument.created_by_id == current_user.id)
+    if unsynced_only:
+        query = query.filter(SupplierReturn.synced_to_1c_at.is_(None))
+
+    returns = query.order_by(SupplierReturn.created_at.desc()).all()
+    return render_template(
+        "receiving/returns.html", returns=returns, unsynced_only=unsynced_only
+    )
+
+
+@bp.route("/new", methods=["GET", "POST"])
+def new_document():
+    if request.method == "GET":
+        warehouses = _receiving_warehouses()
+        return render_template("receiving/new.html", warehouses=warehouses)
+
+    warehouse_id = request.form.get("warehouse_id", type=int)
+    supplier = request.form.get("supplier", "").strip()
+
+    warehouse = _receiving_warehouse_or_none(warehouse_id)
+    if not warehouse:
+        flash("Для приемки выберите один из разрешенных складов", "danger")
+        return redirect(url_for("receiving.new_document"))
+
+    doc = ReceivingDocument(
+        number=next_number("receiving"),
+        warehouse_id=warehouse_id,
+        supplier=supplier,
+        created_by_id=current_user.id,
+    )
+    db.session.add(doc)
+    db.session.commit()
+    flash(f"Документ приемки {doc.number} создан", "success")
+    return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+
+def _find_or_create_supplier(name, inn, phone):
+    supplier = None
+    if inn:
+        supplier = Supplier.query.filter_by(inn=inn).first()
+    if not supplier:
+        supplier = Supplier.query.filter_by(name=name).first()
+    if not supplier:
+        supplier = Supplier(name=name, inn=inn, phone=phone)
+        db.session.add(supplier)
+        db.session.flush()
+    else:
+        # ИНН однозначно связывает накладную с карточкой поставщика, но
+        # имя/телефон в карточке могли быть заведены с ошибкой или устареть.
+        # Источником актуальных реквизитов при импорте является сама
+        # накладная 1С, поэтому обновляем карточку, не создавая дубль.
+        if name and supplier.name != name:
+            supplier.name = name
+        if phone and supplier.phone != phone:
+            supplier.phone = phone
+    return supplier
+
+
+def _find_nomenclature_for_invoice_row(row):
+    """Сопоставляет строку накладной с номенклатурой по штрихкоду (если в
+    файле есть такая колонка — сейчас ее нет, но может появиться) либо по
+    точному названию товара. Код 1С ("Код") — внутренняя нумерация
+    поставщика и с sku в номенклатуре не связана, поэтому не используется."""
+    barcode = row.get("barcode")
+    if barcode:
+        item = Nomenclature.find_by_barcode(barcode)
+        if item:
+            return item
+    name = row["name"].strip()
+    return Nomenclature.query.filter(func.lower(Nomenclature.name) == name.lower()).first()
+
+
+@bp.route("/import-invoice", methods=["GET", "POST"])
+def import_invoice_form():
+    """Загрузка приходной накладной из 1С (см.
+    utils.receiving_invoice_import) — вместо ручного создания документа и
+    добавления позиций одна за другой: номер накладной становится номером
+    приемки, поставщик определяется из файла (и заводится в справочник,
+    если его еще нет), товары и количество подставляются из накладной.
+    Дальше кладовщик сверяет их на мобильной форме (см. confirm_invoice)."""
+    if request.method == "GET":
+        warehouses = _receiving_warehouses()
+        return render_template("receiving/import_invoice.html", warehouses=warehouses)
+
+    warehouse_id = request.form.get("warehouse_id", type=int)
+    warehouse = _receiving_warehouse_or_none(warehouse_id)
+    if not warehouse:
+        flash("Для приемки выберите один из разрешенных складов", "danger")
+        return redirect(url_for("receiving.import_invoice_form"))
+
+    file = request.files.get("file")
+    if not file or file.filename == "":
+        flash("Выберите файл накладной (.xlsx)", "danger")
+        return redirect(url_for("receiving.import_invoice_form"))
+
+    # В новой форме 1С заказ указан у каждой товарной строки. Ручное поле
+    # остается запасным вариантом для старых файлов без колонки «Заказ».
+    fallback_order_number = request.form.get("order_number", "").strip()
+    file_bytes = file.read()
+
+    try:
+        invoice = parse_invoice(io.BytesIO(file_bytes))
+    except InvoiceParseError as exc:
+        flash(f"Не удалось разобрать файл накладной: {exc}", "danger")
+        return redirect(url_for("receiving.import_invoice_form"))
+    except Exception as exc:  # noqa: BLE001 — файл пришел от внешнего источника (1С)
+        current_app.logger.exception("Не удалось прочитать файл накладной")
+        flash(f"Не удалось прочитать файл: {exc}", "danger")
+        return redirect(url_for("receiving.import_invoice_form"))
+
+    missing_order_rows = [
+        row["name"]
+        for row in invoice.rows
+        if not row.get("order_number") and not fallback_order_number
+    ]
+    if missing_order_rows:
+        flash(
+            "В файле не указан заказ для некоторых товаров. Укажите № заказа вручную "
+            "для старой формы накладной или загрузите новую форму с колонкой «Заказ».",
+            "danger",
+        )
+        return redirect(url_for("receiving.import_invoice_form"))
+
+    order_numbers = []
+    for row in invoice.rows:
+        row["order_number"] = row.get("order_number") or fallback_order_number
+        if row["order_number"] not in order_numbers:
+            order_numbers.append(row["order_number"])
+
+    if ReceivingDocument.query.filter_by(number=invoice.invoice_number).first():
+        flash(f"Накладная № {invoice.invoice_number} уже была загружена раньше", "danger")
+        return redirect(url_for("receiving.import_invoice_form"))
+
+    try:
+        supplier = _find_or_create_supplier(invoice.supplier_name, invoice.supplier_inn, invoice.supplier_phone)
+
+        doc = ReceivingDocument(
+            number=invoice.invoice_number,
+            warehouse_id=warehouse_id,
+            # Снимок имени именно из этой накладной. Он не должен зависеть
+            # от старого значения карточки поставщика и не изменится задним
+            # числом при следующих обновлениях справочника.
+            supplier=invoice.supplier_name,
+            supplier_id=supplier.id,
+            created_by_id=current_user.id,
+            # Поле документа оставляем для списка/поиска и совместимости со
+            # старыми данными; точная привязка хранится в ReceivingLine.
+            order_number=", ".join(order_numbers)[:50] or None,
+            invoice_file_data=file_bytes,
+            invoice_file_name=file.filename,
+        )
+        db.session.add(doc)
+        db.session.flush()
+
+        matched = 0
+        unmatched_names = []
+        for row in invoice.rows:
+            item = _find_nomenclature_for_invoice_row(row)
+            if not item:
+                unmatched_names.append(row["name"])
+                continue
+            db.session.add(
+                ReceivingLine(
+                    document_id=doc.id,
+                    nomenclature_id=item.id,
+                    qty=row["qty"],
+                    expected_qty=row["qty"],
+                    order_number=row["order_number"],
+                )
+            )
+            matched += 1
+        db.session.commit()
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        current_app.logger.exception("Не удалось создать документ приемки из накладной")
+        flash(
+            "Файл разобран, но не удалось создать документ приемки — попробуйте еще раз "
+            "или обратитесь к администратору",
+            "danger",
+        )
+        return redirect(url_for("receiving.import_invoice_form"))
+
+    message = f"Накладная № {doc.number} загружена: {matched} поз. от «{supplier.name}»"
+    if unmatched_names:
+        shown = ", ".join(unmatched_names[:5])
+        more = "…" if len(unmatched_names) > 5 else ""
+        message += (
+            f". Не найдено в номенклатуре по названию/штрихкоду: {len(unmatched_names)} поз. "
+            f"({shown}{more}) — добавьте их в документ вручную"
+        )
+    flash(message, "warning" if unmatched_names else "success")
+    return redirect(url_for("receiving.confirm_invoice", doc_id=doc.id))
+
+
+@bp.route("/<int:doc_id>/confirm")
+def confirm_invoice(doc_id):
+    """Упрощенная мобильная форма приемки по загруженной накладной —
+    специально без коробов/ячеек и прочих возможностей обычной приемки:
+    список товаров, ожидаемое количество, поле для фактического и галочка
+    "принято", чтобы кладовщику было удобно свериться с телефона."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    lines = doc.lines.order_by(ReceivingLine.id).all()
+    confirmed_count = sum(1 for line in lines if line.confirmed)
+    return render_template(
+        "receiving/confirm_invoice.html",
+        doc=doc,
+        lines=lines,
+        confirmed_count=confirmed_count,
+        add_request_token=secrets.token_urlsafe(24),
+    )
+
+
+@bp.route("/<int:doc_id>/invoice-file")
+def download_invoice_file(doc_id):
+    """Оригинал файла накладной, сохраненный при загрузке (см.
+    import_invoice_form) — на случай спора с поставщиком или сверки с
+    бухгалтерией задним числом."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if not doc.invoice_file_data:
+        flash("Файл накладной для этого документа не сохранен", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+    fname = doc.invoice_file_name or f"{doc.number}.xlsx"
+    return Response(
+        doc.invoice_file_data,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": content_disposition(fname)},
+    )
+
+
+@bp.route("/<int:doc_id>/lines/<int:line_id>/confirm", methods=["POST"])
+def confirm_line(doc_id, line_id):
+    """AJAX: сохраняет фактическое количество и отметку "принято" для одной
+    строки накладной — без перезагрузки страницы, чтобы сверка на телефоне
+    шла быстро, строка за строкой."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    # draft — обычная сверка при вводе; recounting — исправление количества
+    # по факту пересчета (см. send_to_recount).
+    if doc.status not in ("draft", "recounting"):
+        return jsonify({"ok": False, "error": "Документ уже завершен"}), 400
+
+    line = ReceivingLine.query.filter_by(id=line_id, document_id=doc_id).first_or_404()
+    data = request.get_json(silent=True) or {}
+    try:
+        qty = float(data.get("qty"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Некорректное количество"}), 400
+    if qty < 0:
+        return jsonify({"ok": False, "error": "Количество не может быть отрицательным"}), 400
+
+    if line.box_id:
+        try:
+            _check_box_qty_limit(line.box, qty - line.qty)
+        except BoxQtyLimitExceeded as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        box_item = BoxItem.query.filter_by(box_id=line.box_id, nomenclature_id=line.nomenclature_id).first()
+        if box_item:
+            box_item.qty += qty - line.qty
+            if box_item.qty <= 0:
+                db.session.delete(box_item)
+
+    line.qty = qty
+    line.confirmed = bool(data.get("confirmed"))
+    db.session.commit()
+
+    return jsonify(
+        {
+            "ok": True,
+            "confirmed_count": doc.lines.filter_by(confirmed=True).count(),
+            "total_count": doc.lines.count(),
+        }
+    )
+
+
+@bp.route("/<int:doc_id>")
+def detail(doc_id):
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    lines = doc.lines.all()
+
+    # "Активный" короб — как и в Размещении: выбирается сканированием/
+    # созданием и хранится в адресе страницы (?box=ID), чтобы дальше
+    # сканировать в него товар штрихкод за штрихкодом. Пока короб не выбран,
+    # приемка работает как раньше — просто по количеству, в неразмещенный
+    # остаток.
+    active_box = None
+    active_box_id = request.args.get("box", type=int)
+    if active_box_id:
+        active_box = Box.query.filter_by(id=active_box_id, warehouse_id=doc.warehouse_id).first()
+
+    packed_box_ids = {line.box_id for line in lines if line.box_id}
+    packed_boxes = (
+        Box.query.filter(Box.id.in_(packed_box_ids)).all() if packed_box_ids else []
+    )
+
+    warehouses = _receiving_warehouses()
+
+    return render_template(
+        "receiving/detail.html",
+        doc=doc,
+        lines=lines,
+        active_box=active_box,
+        packed_boxes=packed_boxes,
+        warehouses=warehouses,
+        add_request_token=secrets.token_urlsafe(24),
+    )
+
+
+def _existing_add_request(request_token):
+    if not request_token:
+        return None
+    return ReceivingLine.query.filter_by(request_token=request_token).first()
+
+
+def _commit_receiving_add(line, request_token):
+    """Коммитит добавление и превращает гонку одинаковых запросов в
+    безопасный повтор. Уникальный индекс защищает даже два одновременных
+    запроса, пришедших в разные процессы приложения."""
+    try:
+        db.session.commit()
+        return line, False
+    except IntegrityError:
+        db.session.rollback()
+        existing = _existing_add_request(request_token)
+        if existing:
+            return existing, True
+        raise
+
+
+def _add_or_increment_line(doc, nomenclature, qty, request_token=None):
+    existing = _existing_add_request(request_token)
+    if existing:
+        return existing, True
+    line = ReceivingLine(
+        document_id=doc.id,
+        nomenclature_id=nomenclature.id,
+        qty=qty,
+        request_token=request_token or None,
+    )
+    db.session.add(line)
+    return _commit_receiving_add(line, request_token)
+
+
+# Физический лимит на короб — не может лежать больше 300 шт суммарно,
+# независимо от вида товара (см. чат: "запрет на ввод кол-ва в коробе
+# больше 300 шт"). В отличие от _box_category_warning (мягкое
+# предупреждение по одному виду) — это жесткий запрет по всему коробу.
+BOX_QTY_LIMIT = 300
+
+
+def _box_total_qty(box_id):
+    return (
+        db.session.query(func.sum(BoxItem.qty))
+        .filter(BoxItem.box_id == box_id)
+        .scalar()
+    ) or 0
+
+
+def _box_qty_limit_message(box, attempted_total):
+    return (
+        f"В коробе {box.box_number} максимум {BOX_QTY_LIMIT:g} шт — "
+        f"стало бы {attempted_total:g} шт"
+    )
+
+
+class BoxQtyLimitExceeded(Exception):
+    """Суммарное количество товара в коробе после изменения превысило бы
+    BOX_QTY_LIMIT. box/attempted_total — чтобы вызывающий код сам решил,
+    как сообщить об этом (flash или JSON-ошибка)."""
+
+    def __init__(self, box, attempted_total):
+        self.box = box
+        self.attempted_total = attempted_total
+        super().__init__(_box_qty_limit_message(box, attempted_total))
+
+
+def _check_box_qty_limit(box, delta):
+    attempted = _box_total_qty(box.id) + delta
+    if attempted > BOX_QTY_LIMIT:
+        raise BoxQtyLimitExceeded(box, attempted)
+
+
+def _box_category_warning(box, item):
+    """Если суммарное количество товара ВИДА item в этом коробе превысило
+    порог, заданный у вида (см. ProductCategory.box_qty_warning, настройка —
+    «Производство» → «Настройки») — предупреждение для приемщика: похоже
+    на лишний скан/ошибку, а не настоящую такую партию в одном коробе.
+    None — вид не задан, порог не настроен, либо порог еще не превышен."""
+    category = item.category
+    if not category or not category.box_qty_warning:
+        return None
+
+    total = (
+        db.session.query(func.sum(BoxItem.qty))
+        .join(Nomenclature, BoxItem.nomenclature_id == Nomenclature.id)
+        .filter(BoxItem.box_id == box.id, Nomenclature.category_id == category.id)
+        .scalar()
+    ) or 0
+    if total <= category.box_qty_warning:
+        return None
+    return {"category": category.name, "qty": total, "threshold": category.box_qty_warning}
+
+
+def _receive_item_into_box(doc, box, item, qty, request_token=None):
+    """Приемка сразу в короб — товар физически упаковывается в момент
+    приемки, минуя неразмещенный остаток (см. complete(): строки с box_id
+    в него не идут).
+
+    Если у этого же товара на этом складе уже есть неразмещенный остаток
+    (висит с прошлой, еще не до конца размещенной приемки) — считаем, что
+    физически это те же единицы, которые наконец кладут в короб, и
+    списываем их со старого остатка вместо того, чтобы задваивать учет
+    (остаток "висел" неразмещенным — и теперь еще и в коробе)."""
+    existing = _existing_add_request(request_token)
+    if existing:
+        return existing, None, True
+
+    _check_box_qty_limit(box, qty)
+
+    dedup_qty = min(qty, UnplacedStock.available(doc.warehouse_id, item.id))
+    if dedup_qty > 0:
+        UnplacedStock.consume(doc.warehouse_id, item.id, dedup_qty)
+
+    box_item = BoxItem.query.filter_by(box_id=box.id, nomenclature_id=item.id).first()
+    if box_item:
+        box_item.qty += qty
+    else:
+        box_item = BoxItem(box_id=box.id, nomenclature_id=item.id, qty=qty)
+        db.session.add(box_item)
+
+    line = ReceivingLine(
+        document_id=doc.id,
+        nomenclature_id=item.id,
+        qty=qty,
+        box_id=box.id,
+        request_token=request_token or None,
+    )
+    db.session.add(line)
+    log_pack(current_user, box, item.id, qty)
+    line, duplicate = _commit_receiving_add(line, request_token)
+    if duplicate:
+        return line, None, True
+    warning = _box_category_warning(box, item)
+    return line, warning, False
+
+
+@bp.route("/<int:doc_id>/boxes/select", methods=["POST"])
+def select_box(doc_id):
+    """Сканирование/ввод номера короба — берем любой открытый короб этого
+    склада, в т.ч. заготовленный заранее массовым созданием и печатью."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    box_number = request.form.get("box_number", "").strip()
+    box = Box.find_by_scanned_code(box_number, warehouse_id=doc.warehouse_id)
+    if not box:
+        flash(f"Короб '{box_number}' не найден на складе «{doc.warehouse.name}»", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+    box.mark_scanned(current_user)
+    db.session.commit()
+
+    item_count = box.items.count()
+    if item_count > 0:
+        # Не блокируем — короб мог использоваться раньше (перемещением,
+        # предыдущей приемкой) и это ожидаемо, просто предупреждаем, чтобы
+        # не спутать с другим коробом по ошибке.
+        flash(
+            f"В коробе {box.box_number} уже есть товар ({item_count} поз.) — "
+            f"отсканированный товар добавится туда же.",
+            "info",
+        )
+    return redirect(url_for("receiving.detail", doc_id=doc.id, box=box.id))
+
+
+@bp.route("/<int:doc_id>/boxes/create", methods=["POST"])
+def create_box(doc_id):
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if doc.status != "draft":
+        flash("Документ уже завершен", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+    box = Box(box_number=next_number("box"), warehouse_id=doc.warehouse_id, status="open")
+    db.session.add(box)
+    db.session.commit()
+    flash(f"Короб {box.box_number} создан", "success")
+    return redirect(url_for("receiving.detail", doc_id=doc.id, box=box.id))
+
+
+@bp.route("/<int:doc_id>/boxes/<int:box_id>/lines/add-by-barcode", methods=["POST"])
+def add_line_to_box_by_barcode(doc_id, box_id):
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if doc.status != "draft":
+        return jsonify({"ok": False, "error": "Документ уже завершен"}), 400
+
+    box = Box.query.filter_by(id=box_id, warehouse_id=doc.warehouse_id).first()
+    if not box:
+        return jsonify({"ok": False, "error": "Короб не найден"}), 404
+
+    payload = request.json or {}
+    barcode = payload.get("barcode", "").strip()
+    qty = float(payload.get("qty", 1) or 1)
+    request_token = str(payload.get("request_token", ""))[:64]
+    item = Nomenclature.find_by_barcode(barcode)
+    if not item:
+        return jsonify({"ok": False, "error": f"Товар со штрихкодом '{barcode}' не найден"}), 404
+
+    try:
+        line, warning, duplicate = _receive_item_into_box(doc, box, item, qty, request_token)
+    except BoxQtyLimitExceeded as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    resp = {
+        "ok": True,
+        "duplicate": duplicate,
+        "line": {"id": line.id, "name": item.name, "sku": item.sku, "qty": line.qty},
+        "box_item_count": box.items.count(),
+    }
+    if warning:
+        resp["warning"] = warning
+    return jsonify(resp)
+
+
+@bp.route("/<int:doc_id>/boxes/<int:box_id>/lines/add", methods=["POST"])
+def add_line_to_box(doc_id, box_id):
+    """Ручное добавление товара в активный короб (поиск "содержит")."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    box = Box.query.filter_by(id=box_id, warehouse_id=doc.warehouse_id).first()
+    if doc.status != "draft" or not box:
+        flash("Документ уже завершен или короб не найден", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc.id, box=box_id))
+
+    nomenclature_id = request.form.get("nomenclature_id", type=int)
+    qty = request.form.get("qty", type=float) or 1
+    item = Nomenclature.query.get(nomenclature_id)
+    if not item:
+        flash("Товар не найден", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc.id, box=box_id))
+
+    request_token = request.form.get("request_token", "")[:64]
+    try:
+        _line, warning, duplicate = _receive_item_into_box(doc, box, item, qty, request_token)
+    except BoxQtyLimitExceeded as exc:
+        flash(str(exc), "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc.id, box=box_id))
+    if duplicate:
+        flash("Повторный запрос распознан — товар второй раз не добавлен", "info")
+        return redirect(url_for("receiving.detail", doc_id=doc.id))
+    flash(f"В короб {box.box_number} добавлено: {item.name} ({qty} {item.unit})", "success")
+    if warning:
+        flash(
+            f"В коробе {box.box_number} уже {warning['qty']:g} шт. вида «{warning['category']}» "
+            f"— больше обычного порога ({warning['threshold']:g}). Проверьте, не попало ли лишнее.",
+            "warning",
+        )
+    # Сбрасываем активный короб — оператор сразу готов сканировать следующий
+    # короб; чтобы добавить что-то еще в этот же короб, достаточно
+    # отсканировать его номер повторно (find_by_scanned_code найдет его
+    # независимо от того, был ли он активен только что).
+    return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+
+@bp.route("/<int:doc_id>/lines/add-by-barcode", methods=["POST"])
+def add_line_by_barcode(doc_id):
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if doc.status != "draft":
+        return jsonify({"ok": False, "error": "Документ уже завершен"}), 400
+
+    payload = request.json or {}
+    barcode = payload.get("barcode", "").strip()
+    qty = payload.get("qty", 1) or 1
+    request_token = str(payload.get("request_token", ""))[:64]
+    item = Nomenclature.find_by_barcode(barcode)
+    if not item:
+        return jsonify({"ok": False, "error": f"Товар со штрихкодом '{barcode}' не найден"}), 404
+
+    line, duplicate = _add_or_increment_line(doc, item, float(qty), request_token)
+    return jsonify(
+        {
+            "ok": True,
+            "duplicate": duplicate,
+            "line": {"id": line.id, "name": item.name, "sku": item.sku, "qty": line.qty},
+        }
+    )
+
+
+@bp.route("/<int:doc_id>/lines/add", methods=["POST"])
+def add_line(doc_id):
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    # Ту же форму используют и обычная приемка (receiving/detail.html), и
+    # мобильная сверка по накладной (receiving/confirm_invoice.html) — для
+    # товара, которого не было в накладной. Возвращаем туда же, откуда
+    # пришли.
+    next_page = request.form.get("next")
+    redirect_url = (
+        url_for("receiving.confirm_invoice", doc_id=doc.id)
+        if next_page == "confirm"
+        else url_for("receiving.detail", doc_id=doc.id)
+    )
+
+    if doc.status != "draft":
+        flash("Документ уже завершен", "danger")
+        return redirect(redirect_url)
+
+    nomenclature_id = request.form.get("nomenclature_id", type=int)
+    qty = request.form.get("qty", type=float) or 1
+
+    item = Nomenclature.query.get(nomenclature_id)
+    if not item:
+        flash("Товар не найден", "danger")
+        return redirect(redirect_url)
+
+    request_token = request.form.get("request_token", "")[:64]
+    _line, duplicate = _add_or_increment_line(doc, item, qty, request_token)
+    if duplicate:
+        flash("Повторный запрос распознан — товар второй раз не добавлен", "info")
+        return redirect(redirect_url)
+    flash(f"Добавлено: {item.name} ({qty} {item.unit})", "success")
+    return redirect(redirect_url)
+
+
+@bp.route("/<int:doc_id>/lines/<int:line_id>/update", methods=["POST"])
+def update_line(doc_id, line_id):
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    # draft — обычная правка при вводе; recounting — исправление количества
+    # по факту пересчета (см. send_to_recount), если оно не сошлось с тем,
+    # что внесли при приемке. completed — только администратору, задним
+    # числом, если ошибку в количестве заметили уже после завершения (см.
+    # чат); тогда переносим разницу на фактический остаток/короб, как и
+    # update_line_nomenclature переносит остаток при смене товара.
+    editing_after_completed = doc.status == "completed" and current_user.is_admin
+    if doc.status not in ("draft", "recounting") and not editing_after_completed:
+        flash("Документ уже завершен", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    line = ReceivingLine.query.filter_by(id=line_id, document_id=doc_id).first_or_404()
+    qty = request.form.get("qty", type=float)
+    if qty is None or qty < 0:
+        flash("Укажите корректное количество", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    delta = qty - line.qty
+    if line.box_id:
+        try:
+            _check_box_qty_limit(line.box, delta)
+        except BoxQtyLimitExceeded as exc:
+            flash(str(exc), "danger")
+            return redirect(url_for("receiving.detail", doc_id=doc_id))
+        box_item = BoxItem.query.filter_by(box_id=line.box_id, nomenclature_id=line.nomenclature_id).first()
+        if box_item:
+            box_item.qty += delta
+            if box_item.qty <= 0:
+                db.session.delete(box_item)
+    elif editing_after_completed and line.line_completed_at is not None:
+        # Короба нет — в неразмещенный остаток зачислено не обязательно все
+        # good_qty целиком: если в этой же приемке есть еще строки с тем же
+        # товаром, упакованные в короб, часть вычтена (см.
+        # _unboxed_credit_qty, чтобы не задваивать остаток). Поэтому старое
+        # и новое зачисленное количество считаем той же функцией, а не
+        # напрямую через delta по qty.
+        old_credit = _unboxed_credit_qty(doc, line, line.good_qty())
+        new_credit = _unboxed_credit_qty(doc, line, qty - line.defect_qty)
+        credit_delta = new_credit - old_credit
+        if credit_delta < 0 and UnplacedStock.available(doc.warehouse_id, line.nomenclature_id) < -credit_delta:
+            flash(
+                f"Нельзя уменьшить — товар «{line.nomenclature.name}» уже частично размещен в короба",
+                "danger",
+            )
+            return redirect(url_for("receiving.detail", doc_id=doc_id))
+        if credit_delta > 0:
+            UnplacedStock.add(
+                doc.warehouse_id,
+                line.nomenclature_id,
+                credit_delta,
+                receiving_document=doc,
+                order_number=line.order_number,
+            )
+        elif credit_delta < 0:
+            UnplacedStock.consume(doc.warehouse_id, line.nomenclature_id, -credit_delta)
+
+    line.qty = qty
+    if doc.status == "recounting" and line.expected_qty is not None:
+        line.confirmed = True
+    db.session.commit()
+    flash(f"Количество обновлено: {line.nomenclature.name} — {qty} {line.nomenclature.unit}", "success")
+    return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+
+@bp.route("/<int:doc_id>/lines/update-bulk", methods=["POST"])
+def update_lines_bulk(doc_id):
+    """Сохранить количество сразу по всем строкам одной кнопкой — чтобы не
+    перезагружать страницу после правки каждой отдельной строки (см.
+    update_line). Поля формы — qty_<line_id>; строки без изменений и с
+    некорректным значением просто пропускаются, без прерывания остальных."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if doc.status not in ("draft", "recounting"):
+        flash("Документ уже завершен", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    updated = 0
+    skipped_limit = 0
+    for line in doc.lines:
+        raw = request.form.get(f"qty_{line.id}")
+        if raw is None:
+            continue
+        try:
+            qty = float(raw)
+        except ValueError:
+            continue
+        if qty < 0:
+            continue
+
+        if doc.status == "recounting" and line.expected_qty is not None:
+            line.confirmed = True
+        if qty == line.qty:
+            continue
+
+        if line.box_id:
+            try:
+                _check_box_qty_limit(line.box, qty - line.qty)
+            except BoxQtyLimitExceeded:
+                skipped_limit += 1
+                continue
+            box_item = BoxItem.query.filter_by(
+                box_id=line.box_id, nomenclature_id=line.nomenclature_id
+            ).first()
+            if box_item:
+                box_item.qty += qty - line.qty
+                if box_item.qty <= 0:
+                    db.session.delete(box_item)
+
+        line.qty = qty
+        updated += 1
+
+    db.session.commit()
+    if updated:
+        flash(f"Количество обновлено: {updated} поз.", "success")
+    else:
+        flash("Изменений не найдено", "info")
+    if skipped_limit:
+        flash(
+            f"{skipped_limit} поз. не обновлено — короб не может содержать больше {BOX_QTY_LIMIT:g} шт",
+            "warning",
+        )
+    return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+
+@bp.route("/<int:doc_id>/lines/<int:line_id>/nomenclature", methods=["POST"])
+def update_line_nomenclature(doc_id, line_id):
+    """Исправляет товар, под которым по ошибке приняли строку (например,
+    отсканировали похожий, но не тот штрихкод) — доступно только
+    администратору, независимо от статуса документа, и в отличие от
+    редактирования количества переносит уже случившееся влияние на остаток
+    склада на новый товар, а не только правит саму строку:
+      - если строка упакована в короб при приемке (box_id) — переносится
+        соответствующее количество в BoxItem этого короба;
+      - если строка уже зачислена в неразмещенный остаток (line_completed_at,
+        см. _credit_receiving_line) — годное количество списывается с
+        остатка старого товара и зачисляется остатком нового (с партией под
+        эту же приемку, см. UnplacedStock.add), а возврат поставщику по
+        браку этой приемки переносится на новый товар.
+    Если остаток старого товара к этому моменту уже разошелся дальше
+    (размещен в другие короба, отгружен) — спишется сколько осталось
+    (UnplacedStock.consume сам не уходит в минус), дальше по цепочке это
+    уже не отследить, поэтому лучше проверить остатки вручную."""
+    if not current_user.is_admin:
+        flash("Менять товар в строке приемки может только администратор", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    line = ReceivingLine.query.filter_by(id=line_id, document_id=doc_id).first_or_404()
+
+    new_item_id = request.form.get("nomenclature_id", type=int)
+    new_item = Nomenclature.query.get(new_item_id) if new_item_id else None
+    if not new_item:
+        flash("Выберите товар", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    old_item = line.nomenclature
+    if new_item.id == old_item.id:
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    if line.box_id:
+        old_box_item = BoxItem.query.filter_by(
+            box_id=line.box_id, nomenclature_id=old_item.id
+        ).first()
+        moved_qty = min(line.qty, old_box_item.qty) if old_box_item else 0
+        if old_box_item and moved_qty > 0:
+            old_box_item.qty -= moved_qty
+            if old_box_item.qty <= 0:
+                db.session.delete(old_box_item)
+            new_box_item = BoxItem.query.filter_by(
+                box_id=line.box_id, nomenclature_id=new_item.id
+            ).first()
+            if new_box_item:
+                new_box_item.qty += moved_qty
+            else:
+                db.session.add(
+                    BoxItem(box_id=line.box_id, nomenclature_id=new_item.id, qty=moved_qty)
+                )
+    elif line.line_completed_at is not None:
+        good_qty = line.good_qty()
+        if good_qty > 0:
+            UnplacedStock.consume(doc.warehouse_id, old_item.id, good_qty)
+            UnplacedStock.add(
+                doc.warehouse_id,
+                new_item.id,
+                good_qty,
+                receiving_document=doc,
+                order_number=line.order_number,
+            )
+        if line.defect_qty:
+            for supplier_return in SupplierReturn.query.filter_by(
+                receiving_document_id=doc.id, nomenclature_id=old_item.id
+            ).all():
+                supplier_return.nomenclature_id = new_item.id
+
+    line.nomenclature_id = new_item.id
+    db.session.commit()
+    flash(f"Товар в строке изменен: «{old_item.name}» → «{new_item.name}»", "success")
+    return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+
+@bp.route("/<int:doc_id>/lines/<int:line_id>/delete", methods=["POST"])
+def delete_line(doc_id, line_id):
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if doc.status != "draft":
+        flash("Документ уже завершен", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    line = ReceivingLine.query.filter_by(id=line_id, document_id=doc_id).first_or_404()
+    if line.box_id:
+        box_item = BoxItem.query.filter_by(box_id=line.box_id, nomenclature_id=line.nomenclature_id).first()
+        if box_item:
+            box_item.qty -= line.qty
+            if box_item.qty <= 0:
+                db.session.delete(box_item)
+    db.session.delete(line)
+    db.session.commit()
+    return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+
+@bp.route("/<int:doc_id>/delete", methods=["POST"])
+def delete_document(doc_id):
+    """Администратор может удалить приемку в ЛЮБОМ статусе. Черновик/
+    пересчет/разбраковка еще не повлияли на остатки — удаляются как есть.
+    Завершенная приемка уже зачислила неразмещенный остаток (см.
+    complete()) — сначала отменяем этот эффект, точно так же, как при
+    возврате на разбраковку (см. revert_to_sorting): убираем зачисленное
+    и еще не выгруженные в 1С возвраты поставщику. Если часть остатка уже
+    размещена в короба — как и там, откатить нельзя, документ не
+    удаляется (иначе непонятно, какие физические единицы забирать назад)."""
+    if not current_user.is_admin:
+        flash("Удалять документы может только администратор", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    synced_returns = 0
+
+    if doc.status == "completed":
+        lots = UnplacedStockLot.query.filter_by(receiving_document_id=doc.id).all()
+        already_placed = [lot for lot in lots if lot.qty_remaining < lot.qty_received]
+        if already_placed:
+            names = ", ".join(sorted({lot.nomenclature.name for lot in already_placed}))
+            flash(
+                f"Нельзя удалить — товар уже частично размещен в короба: {names}",
+                "danger",
+            )
+            return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+        for lot in lots:
+            row = UnplacedStock.query.filter_by(
+                warehouse_id=doc.warehouse_id, nomenclature_id=lot.nomenclature_id
+            ).first()
+            if row:
+                row.qty = max(row.qty - lot.qty_remaining, 0)
+            db.session.delete(lot)
+
+        synced_returns = (
+            SupplierReturn.query.filter_by(receiving_document_id=doc.id)
+            .filter(SupplierReturn.synced_to_1c_at.isnot(None))
+            .count()
+        )
+        SupplierReturn.query.filter_by(receiving_document_id=doc.id, synced_to_1c_at=None).delete()
+
+    number = doc.number
+    db.session.delete(doc)
+    db.session.commit()
+    message = f"Документ приемки {number} удален"
+    if synced_returns:
+        message += (
+            f". Внимание: по ней уже выгружен(о) в 1С {synced_returns} возврат(ов) "
+            f"поставщику — они не отменены, сверьте вручную."
+        )
+    flash(message, "warning" if synced_returns else "success")
+    return redirect(url_for("receiving.list_documents"))
+
+
+@bp.route("/<int:doc_id>/change-warehouse", methods=["POST"])
+def change_warehouse(doc_id):
+    """Исправление ошибочно выбранного склада — например, сразу после
+    загрузки приходной накладной (см. import_invoice_form) заметили, что
+    выбрали не тот склад. Доступно, пока приемка не завершена — после
+    завершения склад уже зафиксирован в неразмещенном остатке и партиях
+    (см. UnplacedStock/UnplacedStockLot), менять его задним числом нельзя.
+    Короба, уже упакованные в рамках этой приемки, физически остаются на
+    прежнем складе (у Box свой warehouse_id) — поэтому пока такие есть,
+    сначала нужно разобраться с ними, иначе документ будет указывать на
+    один склад, а короба физически лежать на другом."""
+    from ..models import Warehouse
+
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if doc.status == "completed":
+        flash("Приемка уже завершена — склад изменить нельзя", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    packed_box_ids = {line.box_id for line in doc.lines if line.box_id}
+    if packed_box_ids:
+        flash(
+            "В этой приемке уже есть товар, упакованный в короб — сменить склад нельзя, "
+            "пока эти короба привязаны к приемке",
+            "danger",
+        )
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    warehouse_id = request.form.get("warehouse_id", type=int)
+    warehouse = _receiving_warehouse_or_none(warehouse_id)
+    if not warehouse:
+        flash("Для приемки выберите один из разрешенных складов", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+    doc.warehouse_id = warehouse.id
+    db.session.commit()
+    flash(f"Склад приемки изменен на «{warehouse.name}»", "success")
+    return redirect(url_for("receiving.detail", doc_id=doc_id))
+
+
+@bp.route("/<int:doc_id>/send-to-recount", methods=["POST"])
+def send_to_recount(doc_id):
+    """draft -> recounting. Товар физически пересчитывают заново — на этом
+    этапе можно поправить qty по строкам (см. update_line), если пересчет
+    разошелся с тем, что внесли при самой приемке. Пересчет/разбраковка
+    нужны только для приемок, загруженных из накладной (номер приемки —
+    настоящий номер накладной, есть с чем сверять возврат в 1С); обычная
+    приемка в короба завершается сразу из черновика, см. complete()."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if not doc.is_from_invoice_import():
+        flash("Эта приемка не из накладной — пересчет и разбраковка ей не нужны, завершите ее сразу", "danger")
+        return _next_redirect(doc.id)
+
+    if doc.status != "draft":
+        flash("Документ уже отправлен дальше по процессу", "danger")
+        return _next_redirect(doc.id)
+
+    if doc.lines.count() == 0:
+        flash("В документе нет позиций", "danger")
+        return _next_redirect(doc.id)
+
+    doc.status = "recounting"
+    doc.recounting_started_at = datetime.utcnow()
+    db.session.commit()
+    flash(f"Приемка {doc.number} отправлена на пересчет", "success")
+    return _next_redirect(doc.id)
+
+
+def _remove_zero_lines(doc):
+    """Убирает из документа позиции, которых совсем не привезли (qty = 0):
+    пересчет закончен, количество окончательное, а строка с нулем только
+    даёт лишнюю строку при проверке расхождений. Что убрали — запоминаем
+    в doc.removed_zero_lines (для страницы приемки и выгрузки в 1С).
+    Возвращает названия убранных позиций."""
+    removed = list(doc.removed_zero_items())
+    names = []
+    for line in doc.lines.all():
+        if line.qty and line.qty > 0:
+            continue
+        if line.line_completed_at is not None:
+            continue
+        if line.box_id:
+            box_item = BoxItem.query.filter_by(box_id=line.box_id, nomenclature_id=line.nomenclature_id).first()
+            if box_item and box_item.qty <= 0:
+                db.session.delete(box_item)
+        if line.expected_qty is not None:
+            removed.append({
+                "barcode": line.nomenclature.barcode,
+                "name": line.nomenclature.name,
+                "expected_qty": line.expected_qty,
+            })
+        names.append(line.nomenclature.name)
+        db.session.delete(line)
+    if names:
+        doc.removed_zero_lines = json.dumps(removed, ensure_ascii=False)
+    return names
+
+
+@bp.route("/<int:doc_id>/send-to-sorting", methods=["POST"])
+def send_to_sorting(doc_id):
+    """recounting -> sorting. Пересчет подтвержден — дальше выделяем брак
+    построчно (см. update_defect)."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if doc.status != "recounting":
+        flash("Документ не находится на пересчете", "danger")
+        return _next_redirect(doc.id)
+
+    removed_names = _remove_zero_lines(doc)
+    doc.status = "sorting"
+    doc.sorting_started_at = datetime.utcnow()
+    db.session.commit()
+    flash(f"Приемка {doc.number} отправлена на разбраковку", "success")
+    if removed_names:
+        flash(
+            f"Удалены строки с нулевым количеством (товар не привезли): {len(removed_names)} — "
+            + ", ".join(removed_names[:5]) + (" и др." if len(removed_names) > 5 else ""),
+            "info",
+        )
+    return _next_redirect(doc.id)
+
+
+@bp.route("/<int:doc_id>/lines/<int:line_id>/update-defect", methods=["POST"])
+def update_defect(doc_id, line_id):
+    """Выделение кол-ва брака построчно на этапе "Разбраковка". Обычным
+    сотрудникам доступно только для приемок, загруженных из файла накладной
+    (see ReceivingDocument.is_from_invoice_import) — иначе номер приемки не
+    настоящий номер накладной, и 1С возврат не сопоставит; администратор
+    может выделить брак в любом случае и завести возврат в 1С вручную."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if doc.status != "sorting":
+        flash("Документ не находится на разбраковке", "danger")
+        return _next_redirect(doc.id)
+
+    if not doc.is_from_invoice_import() and not current_user.is_admin:
+        flash(
+            "Выделение брака доступно только для приемок, загруженных из накладной, "
+            "либо администратору",
+            "danger",
+        )
+        return _next_redirect(doc.id)
+
+    line = ReceivingLine.query.filter_by(id=line_id, document_id=doc_id).first_or_404()
+    if line.box_id:
+        flash("Товар уже упакован в короб при приемке — разбраковке не подлежит", "danger")
+        return _next_redirect(doc.id)
+    if line.line_completed_at is not None:
+        flash("Строка уже завершена — брак больше нельзя поменять", "danger")
+        return _next_redirect(doc.id)
+
+    defect_qty = request.form.get("defect_qty", type=float) or 0
+    if defect_qty < 0 or defect_qty > line.qty:
+        flash("Кол-во брака не может быть отрицательным или больше принятого", "danger")
+        return _next_redirect(doc.id)
+
+    line.defect_qty = defect_qty
+    # Строка из накладной, которую не трогали на пересчете (кол-во совпало
+    # с накладной, расхождения не было) остается confirmed=False — и
+    # complete() пропускает такую строку ЦЕЛИКОМ (см. комментарий там),
+    # включая уже выделенный здесь брак: ни остаток, ни возврат поставщику
+    # не создались бы, хотя человек только что явно поработал с этой
+    # строкой. Выделение брака — такое же явное подтверждение принятого
+    # qty, как и правка количества на пересчете (см. update_line), поэтому
+    # тоже снимает пометку "не подтверждено".
+    if line.expected_qty is not None:
+        line.confirmed = True
+    db.session.commit()
+    return _next_redirect(doc.id)
+
+
+def _apply_defect_qty_from_form(line):
+    """Кол-во брака теперь заполняется сразу по всем строкам разбраковки и
+    сохраняется одним нажатием — либо общей кнопки "Завершить приемку",
+    либо построчной "Готово" (см. receiving/detail.html: поле defect_qty_<id>
+    без своей формы, с атрибутом form=..., указывающим на нужную кнопку —
+    без перезагрузки страницы на каждое изменение брака, как было раньше
+    через update_defect). Поле в отправленной форме может отсутствовать
+    вовсе (запрос без defect_qty вообще, например от тестов или API) —
+    тогда прежнее defect_qty строки не трогаем. Возвращает текст ошибки
+    или None."""
+    raw = request.form.get(f"defect_qty_{line.id}")
+    if raw is None:
+        return None
+    raw = raw.strip()
+    try:
+        defect_qty = float(raw) if raw else 0.0
+    except ValueError:
+        return f"Некорректное количество брака для «{line.nomenclature.name}»"
+    if defect_qty < 0 or defect_qty > line.qty:
+        return (
+            f"Кол-во брака для «{line.nomenclature.name}» не может быть "
+            "отрицательным или больше принятого"
+        )
+    line.defect_qty = defect_qty
+    if line.expected_qty is not None:
+        line.confirmed = True
+    return None
+
+
+def _unboxed_credit_qty(doc, line, good_qty):
+    """Сколько из годного количества строки накладной зачислить в
+    неразмещенный остаток. Товар, который в этой же приемке уже упаковали в
+    короб (строки с box_id), — это те же единицы из накладной: они уже
+    лежат в коробе, и зачислять их еще раз неразмещенными нельзя (иначе
+    остаток задваивается: 40 в коробах + 40 «неразмещенных»). Упакованное
+    вычитается из строк накладной по этому товару по мере их завершения —
+    и при завершении целиком, и построчно."""
+    if line.box_id:
+        return 0
+    lines = list(doc.lines)
+    boxed = sum(
+        l.qty or 0 for l in lines if l.box_id and l.nomenclature_id == line.nomenclature_id
+    )
+    if not boxed:
+        return good_qty
+    done = sum(
+        l.good_qty() for l in lines
+        if not l.box_id and l.id != line.id and l.nomenclature_id == line.nomenclature_id
+        and l.line_completed_at is not None
+    )
+    return max(done + good_qty - boxed, 0) - max(done - boxed, 0)
+
+
+def _credit_receiving_line(doc, line):
+    """Зачисляет годное количество строки в неразмещенный остаток и, если
+    есть брак, заводит возврат поставщику — общая логика для завершения
+    приемки целиком (complete()) и по отдельной строке (complete_line()).
+    Расхождение с накладной не является возвратом — SupplierReturn
+    создается только из явно указанного defect_qty."""
+    good_qty = line.good_qty()
+    credit_qty = _unboxed_credit_qty(doc, line, good_qty)
+    if credit_qty > 0:
+        UnplacedStock.add(
+            doc.warehouse_id,
+            line.nomenclature_id,
+            credit_qty,
+            receiving_document=doc,
+            order_number=line.order_number,
+        )
+    if line.defect_qty:
+        db.session.add(
+            SupplierReturn(
+                warehouse_id=doc.warehouse_id,
+                nomenclature_id=line.nomenclature_id,
+                qty=line.defect_qty,
+                comment=f"Брак при разбраковке приемки {doc.number}",
+                created_by_id=current_user.id,
+                receiving_document_id=doc.id,
+                supplier_name=doc.supplier,
+                invoice_number=doc.number if doc.is_from_invoice_import() else None,
+                order_number=line.order_number or doc.order_number,
+            )
+        )
+
+
+@bp.route("/<int:doc_id>/complete", methods=["POST"])
+def complete(doc_id):
+    """Приемка из накладной проходит пересчет/разбраковку и завершается из
+    sorting (см. send_to_recount/send_to_sorting). Обычная приемка в короба
+    статусов не имеет вообще — завершается сразу из черновика, как и до
+    появления пересчета/разбраковки. Строки, уже завершенные по отдельности
+    (см. complete_line — на разбраковке можно завершать построчно, не
+    дожидаясь проверки остальных) пропускаются здесь, чтобы не зачислить их
+    дважды — эта кнопка довершает только то, что еще не завершили."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if doc.is_from_invoice_import():
+        if doc.status != "sorting":
+            flash("Сначала пройдите этапы «Пересчет» и «Разбраковка»", "danger")
+            return _next_redirect(doc.id)
+    elif doc.status != "draft":
+        flash("Документ уже завершен", "danger")
+        return _next_redirect(doc.id)
+
+    for line in doc.lines:
+        if line.box_id or line.line_completed_at is not None:
+            # box_id — уже физически упаковано в короб во время приемки,
+            # минуя неразмещенный остаток и разбраковку. line_completed_at —
+            # уже завершено отдельно через "Готово" на этой же строке.
+            continue
+        # Брак по всем открытым строкам вносится прямо на этой отправке
+        # формы (см. _apply_defect_qty_from_form) — до появления этого поля
+        # для сохранения брака требовалась отдельная кнопка на каждую
+        # строку с перезагрузкой страницы.
+        error = _apply_defect_qty_from_form(line)
+        if error:
+            flash(error, "danger")
+            return _next_redirect(doc.id)
+        # У строки из накладной qty до подтверждения равно заявленному
+        # поставщиком количеству. Неподтвержденная позиция не является
+        # фактически принятой и не должна создавать остаток на нашем складе.
+        # Внесение брака выше само по себе подтверждает строку (см.
+        # _apply_defect_qty_from_form), поэтому проверяем confirmed уже
+        # после него, а не до.
+        if line.expected_qty is not None and not line.confirmed:
+            continue
+        _credit_receiving_line(doc, line)
+        line.line_completed_at = datetime.utcnow()
+
+    doc.status = "completed"
+    doc.completed_at = datetime.utcnow()
+    db.session.commit()
+    flash(
+        f"Приемка {doc.number} завершена. Годный товар без короба зачислен в неразмещенный "
+        f"остаток склада «{doc.warehouse.name}» — разместите его в короба и ячейки через "
+        f"«Размещение». Товар, упакованный в короб прямо при приемке, останется в коробе — его "
+        f"нужно только расставить по ячейкам.",
+        "success",
+    )
+    if doc.return_inventory_id:
+        box = Box.query.get(doc.return_inventory_box_id) if doc.return_inventory_box_id else None
+        return redirect(
+            url_for(
+                "inventory.detail",
+                doc_id=doc.return_inventory_id,
+                resume_box_number=box.box_number if box else "",
+            )
+        )
+    return _next_redirect(doc.id)
+
+
+@bp.route("/<int:doc_id>/lines/<int:line_id>/complete-line", methods=["POST"])
+def complete_line(doc_id, line_id):
+    """Завершает ОДНУ строку разбраковки по отдельности, не дожидаясь, пока
+    проверят остальные строки документа (раньше приемку можно было
+    завершить только целиком кнопкой "Завершить приемку" — см. complete()).
+    Как только завершена последняя еще не завершенная строка, документ
+    целиком переходит в completed — так же, как при обычном завершении."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if doc.status != "sorting":
+        flash("Документ не находится на разбраковке", "danger")
+        return _next_redirect(doc.id)
+
+    if not doc.is_from_invoice_import() and not current_user.is_admin:
+        flash(
+            "Завершение строк по отдельности доступно только для приемок, загруженных "
+            "из накладной, либо администратору",
+            "danger",
+        )
+        return _next_redirect(doc.id)
+
+    line = ReceivingLine.query.filter_by(id=line_id, document_id=doc_id).first_or_404()
+    if line.box_id:
+        flash("Товар уже упакован в короб — эта строка уже учтена", "danger")
+        return _next_redirect(doc.id)
+    if line.line_completed_at is not None:
+        flash("Строка уже завершена", "danger")
+        return _next_redirect(doc.id)
+
+    error = _apply_defect_qty_from_form(line)
+    if error:
+        flash(error, "danger")
+        return _next_redirect(doc.id)
+    if line.expected_qty is not None and not line.confirmed:
+        flash("Сначала подтвердите фактическое количество на пересчете", "danger")
+        return _next_redirect(doc.id)
+
+    _credit_receiving_line(doc, line)
+    line.line_completed_at = datetime.utcnow()
+
+    remaining = [l for l in doc.lines if not l.box_id and l.line_completed_at is None]
+    if not remaining:
+        doc.status = "completed"
+        doc.completed_at = datetime.utcnow()
+
+    db.session.commit()
+
+    if not remaining:
+        flash(
+            f"Строка «{line.nomenclature.name}» завершена — это была последняя, приемка "
+            f"{doc.number} полностью завершена. Годный товар без короба зачислен в "
+            f"неразмещенный остаток склада «{doc.warehouse.name}».",
+            "success",
+        )
+    else:
+        flash(f"Строка «{line.nomenclature.name}» завершена", "success")
+    return _next_redirect(doc.id)
+
+
+@bp.route("/<int:doc_id>/revert-to-sorting", methods=["POST"])
+def revert_to_sorting(doc_id):
+    """Админ может вернуть завершенную приемку на разбраковку задним числом
+    (например, приемки, завершенные еще до появления пересчета/разбраковки,
+    или ошиблись с браком). Безопасно, только пока НИЧЕГО из зачисленного
+    по этой приемке остатка еще не размещено в короба — см.
+    UnplacedStockLot.qty_remaining. Если часть уже разместили, откатить
+    нельзя: непонятно, какие именно физические единицы из общего остатка
+    (там могли уже перемешаться с другими партиями) забирать обратно."""
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    if not current_user.is_admin:
+        flash("Вернуть приемку на разбраковку может только администратор", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+    if not doc.is_from_invoice_import():
+        flash("Эта приемка не из накладной — разбраковки у нее не было, откатывать некуда", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+    if doc.status != "completed":
+        flash("Приемка не завершена", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+    lots = UnplacedStockLot.query.filter_by(receiving_document_id=doc.id).all()
+    already_placed = [lot for lot in lots if lot.qty_remaining < lot.qty_received]
+    if already_placed:
+        names = ", ".join(sorted({lot.nomenclature.name for lot in already_placed}))
+        flash(
+            f"Нельзя вернуть на разбраковку — товар уже частично размещен в короба: {names}",
+            "danger",
+        )
+        return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+    for lot in lots:
+        row = UnplacedStock.query.filter_by(
+            warehouse_id=doc.warehouse_id, nomenclature_id=lot.nomenclature_id
+        ).first()
+        if row:
+            row.qty = max(row.qty - lot.qty_remaining, 0)
+        db.session.delete(lot)
+
+    # Возвраты, которые 1С уже забрала, отменить нельзя — предупреждаем и
+    # оставляем как есть; неподтвержденные (еще не выгруженные) удаляем —
+    # разбраковка сейчас пройдет заново и решит по браку заново.
+    synced_returns = SupplierReturn.query.filter_by(
+        receiving_document_id=doc.id
+    ).filter(SupplierReturn.synced_to_1c_at.isnot(None)).count()
+    SupplierReturn.query.filter_by(
+        receiving_document_id=doc.id, synced_to_1c_at=None
+    ).delete()
+
+    # Строки, завершенные по отдельности (см. complete_line), тоже
+    # откатываются — иначе после возврата на разбраковку они остались бы
+    # помеченными "Готово" без возможности поправить брак или завершить
+    # заново, хотя их зачисленный остаток/возврат уже отменены выше.
+    for line in doc.lines:
+        if not line.box_id:
+            line.line_completed_at = None
+
+    doc.status = "sorting"
+    doc.completed_at = None
+    db.session.commit()
+
+    message = f"Приемка {doc.number} возвращена на разбраковку."
+    if synced_returns:
+        message += (
+            f" Внимание: по ней уже выгружен(о) в 1С {synced_returns} возврат(ов) поставщику — "
+            f"они не отменены, сверьте вручную."
+        )
+    flash(message, "warning" if synced_returns else "success")
+    return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+
+def _doubled_receipts():
+    """Явные задвоения неразмещенного остатка. По каждому товару и складу
+    проигрываем историю по времени, разрешая остатку уходить в минус:
+      + партия неразмещенного остатка (зачисление приемки, излишек и т.п.);
+      − приемка сразу в короб (время — создание документа приемки);
+      − размещение из неразмещенного в короба (время — создание документа).
+    Приемка в короб, когда неразмещенного остатка не было, уводит остаток в
+    минус; если потом этот минус закрывает зачисление другой (или той же)
+    приемки — это те же единицы, посчитанные второй раз: явное задвоение.
+    Приемки, где упакованное уже вычтено при завершении (после
+    исправления), учитываются без двойного вычета."""
+    events = {}
+
+    def add(key, when, qty, kind, ref):
+        events.setdefault(key, []).append((when or datetime.min, kind, qty, ref))
+
+    for lot in UnplacedStockLot.query.all():
+        add((lot.warehouse_id, lot.nomenclature_id), lot.received_at, lot.qty_received or 0, "credit", lot)
+
+    for doc in ReceivingDocument.query.all():
+        lines = list(doc.lines)
+        boxed, good = {}, {}
+        for line in lines:
+            if line.box_id:
+                boxed[line.nomenclature_id] = boxed.get(line.nomenclature_id, 0) + (line.qty or 0)
+            elif line.line_completed_at is not None:
+                good[line.nomenclature_id] = good.get(line.nomenclature_id, 0) + line.good_qty()
+        for nid, qty in boxed.items():
+            # Упакованное, которое приемка сама уже вычла из зачисления строки
+            # накладной (после исправления), повторно не вычитаем.
+            if nid in good:
+                credited = sum(
+                    l.qty_received for l in UnplacedStockLot.query.filter_by(
+                        receiving_document_id=doc.id, nomenclature_id=nid
+                    )
+                )
+                qty -= min(max(good[nid] - credited, 0), qty)
+            if qty > 0:
+                add((doc.warehouse_id, nid), doc.created_at or doc.completed_at, qty, "box", doc)
+
+    for line in PlacementLine.query.all():
+        pdoc = line.document
+        if pdoc is not None:
+            add((pdoc.warehouse_id, line.nomenclature_id), pdoc.created_at or pdoc.completed_at, line.qty or 0, "place", pdoc)
+
+    pairs = {}
+    for (warehouse_id, nid), items in events.items():
+        if not any(kind == "box" for _, kind, _, _ in items):
+            continue
+        # При равном времени сначала списания, потом зачисления.
+        items.sort(key=lambda e: (e[0], 0 if e[1] != "credit" else 1))
+        balance = 0.0
+        holes = []  # [кол-во в минусе, документ приемки в короб]
+        for when, kind, qty, ref in items:
+            if kind == "credit":
+                if balance < 0 and ref.receiving_document_id:
+                    cover = qty
+                    while cover > 0 and holes:
+                        take = min(holes[0][0], cover)
+                        key = (holes[0][1].id, ref.receiving_document_id, nid)
+                        pairs[key] = pairs.get(key, 0) + take
+                        holes[0][0] -= take
+                        cover -= take
+                        if holes[0][0] <= 0:
+                            holes.pop(0)
+                elif balance < 0:
+                    # Зачисление без приемки (излишек и т.п.) тоже закрывает минус,
+                    # но задвоением приемки не считается.
+                    cover = qty
+                    while cover > 0 and holes:
+                        take = min(holes[0][0], cover)
+                        holes[0][0] -= take
+                        cover -= take
+                        if holes[0][0] <= 0:
+                            holes.pop(0)
+                balance += qty
+            elif kind == "box":
+                shortfall = qty - max(balance, 0)
+                if shortfall > 0:
+                    holes.append([shortfall, ref])
+                balance -= qty
+            else:
+                balance -= qty
+
+    rows = []
+    for (box_doc_id, credit_doc_id, nid), qty in pairs.items():
+        box_doc = db.session.get(ReceivingDocument, box_doc_id)
+        credit_doc = db.session.get(ReceivingDocument, credit_doc_id)
+        item = db.session.get(Nomenclature, nid)
+        if box_doc is None or credit_doc is None or item is None:
+            continue  # документ или товар удалены — показывать нечего
+        fixed = db.session.get(AppSetting, f"rcv_dbl:{box_doc_id}:{credit_doc_id}:{nid}")
+        rows.append({
+            "key": f"rcv_dbl:{box_doc_id}:{credit_doc_id}:{nid}",
+            "box_doc": box_doc, "credit_doc": credit_doc, "item": item,
+            "warehouse": box_doc.warehouse, "doubled": round(qty, 3),
+            "box_qty": sum(l.qty or 0 for l in box_doc.lines if l.box_id and l.nomenclature_id == nid),
+            "unplaced": UnplacedStock.available(box_doc.warehouse_id, nid),
+            "fixed": fixed.value if fixed else None,
+        })
+    # Старые документы могут быть без даты создания (колонку добавили позже).
+    rows.sort(key=lambda r: r["box_doc"].created_at or r["box_doc"].completed_at or datetime.min, reverse=True)
+    rows.sort(key=lambda r: r["fixed"] is not None)
+    return rows
+
+
+@bp.route("/doubled", methods=["GET", "POST"])
+def doubled_receipts():
+    """Отчет «Задвоенные приемки» и списание задвоения (только админ)."""
+    if not current_user.is_admin:
+        flash("Доступно только администратору", "danger")
+        return redirect(url_for("receiving.list_documents"))
+    try:
+        rows = _doubled_receipts()
+    except Exception as exc:  # noqa: BLE001 — отчет по старым данным не должен ронять страницу
+        current_app.logger.exception("Отчет «Задвоенные приемки» не построился")
+        flash(f"Отчет не построился: {type(exc).__name__}: {exc}. Пришлите этот текст разработчику.", "danger")
+        return redirect(url_for("receiving.list_documents"))
+    if request.method == "POST":
+        wanted = set(request.form.getlist("key"))
+        done = 0
+        for row in rows:
+            if row["fixed"] or (row["key"] not in wanted and request.form.get("all") != "1"):
+                continue
+            qty = min(row["doubled"], UnplacedStock.available(row["warehouse"].id, row["item"].id))
+            if qty > 0:
+                UnplacedStock.consume(row["warehouse"].id, row["item"].id, qty)
+            db.session.add(AppSetting(key=row["key"], value=f"{qty:g} {datetime.utcnow():%d.%m.%Y} {current_user.username}"[:200]))
+            current_app.logger.warning(
+                "Задвоение списано: короба %s, зачисление %s, %s, %g (пользователь %s)",
+                row["box_doc"].number, row["credit_doc"].number, row["item"].name, qty, current_user.username,
+            )
+            done += 1
+        db.session.commit()
+        flash(f"Задвоение списано по {done} строкам", "success")
+        return redirect(url_for("receiving.doubled_receipts"))
+    # Списанные строки в отчете больше не показываем.
+    return render_template("receiving/doubled.html", rows=[r for r in rows if not r["fixed"]])
+
+
+@bp.route("/<int:doc_id>/export.xlsx")
+def export_document(doc_id):
+    doc = ReceivingDocument.query.get_or_404(doc_id)
+    data = export_receiving_to_excel([doc])
+    fname = f"{doc.number}_{timestamp_for_filename()}.xlsx"
+    return Response(
+        data,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": content_disposition(fname)},
+    )

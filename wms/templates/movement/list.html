@@ -1,0 +1,580 @@
+{% extends "base.html" %}
+{% block title %}Перемещение{% endblock %}
+{% block content %}
+<div class="mobile-compact-list-page">
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4">
+  <h3 class="mb-0">Перемещение товара</h3>
+  <div class="d-flex flex-wrap gap-2">
+    <a class="btn btn-outline-primary" href="{{ url_for('movement.box_transfer') }}">↔ Из короба в короб</a>
+    {% if current_user.is_admin %}
+    {% if marketplace_api_enabled %}<a class="btn btn-outline-warning" href="{{ url_for('movement.receive_review') }}">🔎 Проверить приемку (API Ozon/WB)</a>{% endif %}
+    <a class="btn btn-outline-secondary" href="{{ url_for('receipt_audit.index') }}" title="Проверить все непринятые перемещения на Ozon по отчётам о приёмке: провести совпавшие, исправить недостачи">📄 Проверка по отчётам (файлы)</a>
+    {% endif %}
+    <form method="get" action="{{ url_for('movement.export_summary') }}"
+          class="d-none d-md-flex align-items-center gap-1"
+          title="Одна строка на документ (кол-во коробов и кол-во товара) + отдельная страница с отгрузками по дням">
+      <input type="date" name="date_from" class="form-control form-control-sm" style="width:150px" title="Отгружено с">
+      <span>—</span>
+      <input type="date" name="date_to" class="form-control form-control-sm" style="width:150px" title="Отгружено по">
+      <button type="submit" class="btn btn-outline-secondary">📊 Сводный экспорт</button>
+    </form>
+    <a class="btn btn-primary" href="{{ url_for('movement.new_document') }}">➕ Новое перемещение</a>
+  </div>
+</div>
+
+{% set hint_route_box = "Сканируете короб — показываем, на какой склад-город его отправлять по текущему плану отгрузок (по остатку невыполненной потребности). Если потребности нет ни у кого — короб можно пропустить." %}
+{% set hint_find_box = "Не получается добавить короб в перемещение? Проверьте, в каком документе он уже числится." %}
+
+<div class="card p-3 mb-4">
+  <h5 class="d-flex align-items-center gap-2">
+    Куда везти короб
+    <button type="button" class="hint-icon d-md-none" data-bs-toggle="popover" data-bs-trigger="focus"
+            data-bs-placement="bottom" data-bs-content="{{ hint_route_box }}" aria-label="Подсказка">?</button>
+  </h5>
+  <p class="text-muted small d-none d-md-block">{{ hint_route_box }}</p>
+  <form method="get" action="{{ url_for('movement.route_box') }}" id="routeBoxForm" class="d-flex gap-2" style="max-width:480px">
+    <input type="text" name="box_number" id="routeBoxInput" class="form-control form-control-lg" placeholder="Отсканируйте или введите номер короба" value="{{ route_box_number }}" required autofocus>
+    <button type="button" class="btn btn-outline-primary" data-camera-scan-target="#routeBoxInput" title="Сканировать камерой">📷</button>
+    <button type="submit" class="btn btn-primary">Найти</button>
+  </form>
+
+  {% if route_box_number %}
+    {% if route_not_found %}
+      <div class="alert alert-danger mt-3 mb-0">Короб «{{ route_box_number }}» не найден.</div>
+    {% elif route_box %}
+      <div class="mt-3">
+        <b>Содержимое короба:</b>
+        {% for it in route_box.items %}
+          <div>{{ it.nomenclature.name }} — {{ it.qty }} {{ it.nomenclature.unit }}</div>
+        {% else %}
+          <div class="text-muted">короб пуст</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+    {% if route_box and not routing %}
+      <div class="alert alert-secondary mt-3 mb-0">
+        <b>Пропускаем.</b> Короб {{ route_box.box_number }}{% if route_box.items.count() == 0 %} пуст —{% else %} —{% endif %}
+        потребности по его содержимому нет ни на одном складе-городе по текущему плану отгрузок.
+      </div>
+    {% elif route_box %}
+      <div class="mt-3">
+        <div class="mb-2"><b>{{ route_box.box_number }}</b></div>
+        <table class="table table-sm table-mobile-compact">
+          <thead><tr><th>Склад-город</th><th></th></tr></thead>
+          <tbody>
+          {% for entry in routing %}
+            <tr{% if loop.first %} class="route-recommended-row"{% endif %}>
+              <td>
+                {% if entry.warehouse.marketplace %}<span class="badge bg-secondary">{{ entry.warehouse.marketplace_label() }}</span>{% endif %}
+                {{ entry.warehouse.name }}{% if loop.first %} <span class="badge bg-success">рекомендуем</span>{% endif %}
+              </td>
+              <td>
+                <form method="post" action="{{ url_for('movement.route_box_add') }}">
+                  <input type="hidden" name="box_id" value="{{ route_box.id }}">
+                  <input type="hidden" name="to_warehouse_id" value="{{ entry.warehouse.id }}">
+                  <button type="submit" class="btn btn-sm btn-outline-primary">Добавить</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+    {% if route_box and routing_explain|default([]) %}
+      <details class="mt-3">
+        <summary class="small" style="cursor:pointer">Почему так: расчёт по каждому городу плана</summary>
+        <div class="table-responsive">
+        <table class="table table-sm small mb-0">
+          <thead><tr><th>Склад-город</th><th>Товар</th><th class="text-end">План</th><th class="text-end">Выполнено</th><th class="text-end">Едет</th><th class="text-end">В черновиках</th><th class="text-end">Цель</th><th class="text-end">Нужно</th><th>Правило</th></tr></thead>
+          <tbody>
+          {% for r in routing_explain %}
+            <tr{% if r.remaining > 0 %} class="table-success"{% endif %}>
+              <td>{{ r.warehouse.name }}</td>
+              <td>{{ r.nomenclature.name if r.nomenclature else '' }}</td>
+              <td class="text-end">{{ r.planned | round(0) | int }}</td>
+              <td class="text-end">{{ r.fulfilled | round(0) | int }}</td>
+              <td class="text-end">{{ r.in_transit | round(0) | int }}</td>
+              <td class="text-end">{{ r.drafts | round(0) | int }}</td>
+              <td class="text-end">{{ r.target | round(1) }}</td>
+              <td class="text-end"><b>{{ r.remaining | round(1) }}</b></td>
+              <td class="text-muted">{{ r.rule }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      </details>
+    {% endif %}
+  {% endif %}
+</div>
+
+<div class="card p-3 mb-4">
+  <h5 class="d-flex align-items-center gap-2">
+    Найти короб
+    <button type="button" class="hint-icon d-md-none" data-bs-toggle="popover" data-bs-trigger="focus"
+            data-bs-placement="bottom" data-bs-content="{{ hint_find_box }}" aria-label="Подсказка">?</button>
+  </h5>
+  <p class="text-muted small d-none d-md-block">{{ hint_find_box }}</p>
+  <form method="get" action="{{ url_for('movement.find_box') }}" class="d-flex gap-2" style="max-width:480px">
+    <input type="text" name="box_number" id="findBoxInput" class="form-control" placeholder="Номер короба" value="{{ find_box_number|default('') }}" required>
+    <button type="button" class="btn btn-outline-primary" data-camera-scan-target="#findBoxInput" title="Сканировать камерой">📷</button>
+    <button type="submit" class="btn btn-outline-primary">Найти</button>
+  </form>
+
+  {% if find_box_number|default('') %}
+    {% if find_box_not_found|default(false) %}
+      <div class="alert alert-danger mt-3 mb-0">Короб «{{ find_box_number }}» не найден.</div>
+    {% elif find_box_lines|default([]) %}
+      <table class="table table-sm table-mobile-compact table-allow-wrap mt-3 mb-0">
+        <thead><tr><th>Перемещение</th><th>Откуда</th><th>Куда</th><th>Статус</th><th>Приемка</th></tr></thead>
+        <tbody>
+        {% for line in find_box_lines %}
+          <tr>
+            <td><a href="{{ url_for('movement.detail', doc_id=line.document.id) }}">{{ line.document.number }}</a></td>
+            <td>{{ line.document.from_warehouse.name }}</td>
+            <td>{% if line.document.to_warehouse.marketplace %}<span class="badge bg-secondary">{{ line.document.to_warehouse.marketplace_label() }}</span> {% endif %}{{ line.document.to_warehouse.name }}</td>
+            <td><span class="badge badge-status-{{ line.document.status }}">{{ 'На сборке' if line.document.status == 'draft' else 'Собрано' }}</span></td>
+            <td>
+              {% if line.document.status != 'completed' %}—
+              {% elif line.document.received_at %}Отгружено
+              {% elif line.document.is_waiting_marketplace_request() %}<span class="badge bg-secondary fw-bold">{{ line.document.transit_status_label() }}</span>
+              {% else %}<span class="text-warning-emphasis">{{ line.document.transit_status_label() }}</span>{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="alert alert-secondary mt-3 mb-0">
+        Короб <b>{{ find_box.box_number }}</b> — сейчас на складе «{{ find_box.warehouse.name }}», ни в одном перемещении не числится.
+      </div>
+    {% endif %}
+  {% endif %}
+</div>
+
+<div class="card p-3 mb-3">
+  <!-- Поиск идет по запросу к БД (см. movement._apply_movement_search), а
+       не JS-фильтром по уже загруженным строкам — находит совпадение по
+       ВСЕМ перемещениям, а не только на текущей странице (см. чат).
+       id нужен, чтобы поля фильтров над колонками таблицы ниже (см.
+       movementFiltersForm) ссылались на эту же форму через form= —
+       отдельная форма на каждое поле задваивала бы отправку и теряла бы
+       значения других фильтров при сбросе страницы. -->
+  <form method="get" action="{{ url_for('movement.list_documents') }}" id="movementFiltersForm" class="d-flex flex-wrap gap-2">
+    <input type="text" name="q" class="form-control" style="max-width:360px"
+           placeholder="Поиск: номер, короб, склад, автор, № заявки на МП — можно несколько слов, например «191 москва»"
+           value="{{ request.args.get('q', '') }}">
+    <button type="submit" class="btn btn-primary">Найти</button>
+    {% set has_filters = request.args.get('q') or request.args.get('mp_request') or request.args.get('number')
+       or request.args.get('from_warehouse_id') or request.args.get('to_warehouse_id')
+       or request.args.get('created_by_id') or request.args.get('status')
+       or request.args.get('date_from') or request.args.get('date_to') %}
+    {% if has_filters %}
+      <a class="btn btn-outline-secondary" href="{{ url_for('movement.list_documents') }}">✕ Сбросить все фильтры</a>
+    {% endif %}
+  </form>
+</div>
+
+<div class="card p-3 movement-list-card">
+  <!-- Массовый выбор/печать и полная таблица со всеми колонками — только
+       на широком экране; на телефоне вместо этого компактный список ниже
+       без 1С/Открыть/Excel и кнопок приемки (это делается на детальной
+       странице документа — открывается по номеру). -->
+  <!-- Формы для поля "№ заявки на МП" вынесены сюда, ЗА пределы
+       waybillsForm ниже — вложенные <form> внутри другого <form> недопустимы
+       в HTML (браузер молча выбрасывает внутренний тег), а вся таблица
+       строк как раз лежит внутри waybillsForm (нужен ей для чекбоксов
+       "Печать/Объединить"). Поле каждой строки ссылается на свою форму
+       здесь через атрибут form=. -->
+  {% for d in documents %}
+  <form id="mpReqForm{{ d.id }}" method="post" action="{{ url_for('movement.update_marketplace_request_number', doc_id=d.id) }}" class="d-none"></form>
+  <form id="deliveryDateForm{{ d.id }}" method="post" action="{{ url_for('movement.update_delivery_slot_date', doc_id=d.id) }}" class="d-none"></form>
+  {% endfor %}
+  <form method="get" action="{{ url_for('movement.export_waybills') }}" id="waybillsForm" class="d-none d-md-block">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <div class="form-check">
+        <input type="checkbox" class="form-check-input" id="selectAllDocs">
+        <label class="form-check-label" for="selectAllDocs">Выбрать все</label>
+      </div>
+      <div class="d-flex gap-2">
+        {% if current_user.is_admin %}
+        {% if current_user.is_main_admin() %}
+        <select name="new_to_warehouse_id" class="form-select form-select-sm" style="width:auto;max-width:230px" id="newDestSelect"
+                title="Куда переделать выбранные перемещения (например, с ВБ на Озон)">
+          <option value="">Склад назначения…</option>
+          {% for wh in destination_choices %}<option value="{{ wh.id }}">{{ wh.marketplace_label() }} · {{ wh.name }}</option>{% endfor %}
+        </select>
+        <button type="submit" formmethod="post" formaction="{{ url_for('movement.change_destination') }}" class="btn btn-outline-secondary btn-sm" id="changeDestBtn" disabled
+                onclick="var s=document.getElementById('newDestSelect'); return confirm('Сменить склад назначения у выбранных перемещений на «' + s.options[s.selectedIndex].text + '»? Принятые и объединенные документы не изменятся; номер заявки на МП сбросится, если маркетплейс другой. Для Озон документы больше 30 коробов разобьются по 30.');">↪ Сменить склад получатель (<span id="selectedDocsCount4">0</span>)</button>
+        {% endif %}
+        <button type="submit" formmethod="post" formaction="{{ url_for('movement.merge_documents') }}" class="btn btn-outline-secondary btn-sm" id="mergeDocsBtn" disabled
+                onclick="return confirm('Объединить выбранные черновики в один документ? Короба переедут в новый документ, старые останутся в истории со статусом «Объединен».');">🔀 Объединить выбранные (<span id="selectedDocsCount3">0</span>)</button>
+        {% endif %}
+        <button type="submit" formaction="{{ url_for('movement.export_shipping_labels') }}" class="btn btn-outline-secondary btn-sm" id="printLabelsBtn" disabled>🏷️ Стикеры на короба (<span id="selectedDocsCount2">0</span>)</button>
+        <button type="submit" class="btn btn-outline-secondary btn-sm" id="printWaybillsBtn" disabled>🖨️ Печать накладных по выбранным (<span id="selectedDocsCount">0</span>)</button>
+      </div>
+    </div>
+    <table class="table">
+      <thead>
+        <tr><th></th><th>Номер</th><th>Дата</th><th>Откуда</th><th>Куда</th><th>Коробов</th><th>Кол-во товара</th><th>Автор</th><th>Статус</th><th>Приемка</th>{% if one_c_integration_enabled %}<th class="text-center">1С</th>{% endif %}<th class="text-center">Заявка на МП</th><th>№ заявки на МП</th><th title="Дата слота, забронированного на маркетплейсе — печатается на стикерах отправления вместо сегодняшней даты">Дата поставки</th>{% if current_user.is_admin %}<th class="text-center">Отгружено</th>{% endif %}<th></th></tr>
+        <!-- Фильтры над колонками (см. чат) — отдельный вид фильтра от
+             общего поиска выше: каждое поле бьет по своей колонке точным
+             совпадением (или диапазоном для дат), а не подстрокой сразу по
+             многим полям. Все поля отправляются в ту же форму
+             movementFiltersForm (см. выше) через form= — здесь не может
+             быть своего <form>, эта строка лежит внутри waybillsForm. -->
+        <tr class="movement-filter-row">
+          {% if one_c_integration_enabled %}<th></th>{% endif %}
+          <th>
+            <input type="text" name="number" form="movementFiltersForm" class="form-control form-control-sm"
+                   placeholder="№…" value="{{ request.args.get('number', '') }}" data-submit-on-enter>
+          </th>
+          <th>
+            <div class="d-flex flex-column gap-1">
+              <input type="date" name="date_from" form="movementFiltersForm" class="form-control form-control-sm" title="С даты"
+                     value="{{ request.args.get('date_from', '') }}" onchange="this.form.submit()">
+              <input type="date" name="date_to" form="movementFiltersForm" class="form-control form-control-sm" title="По дату"
+                     value="{{ request.args.get('date_to', '') }}" onchange="this.form.submit()">
+            </div>
+          </th>
+          <th>
+            <select name="from_warehouse_id" form="movementFiltersForm" class="form-select form-select-sm" onchange="this.form.submit()">
+              <option value="">Все</option>
+              {% for wh in from_warehouses %}
+              <option value="{{ wh.id }}" {% if request.args.get('from_warehouse_id') == wh.id|string %}selected{% endif %}>{{ wh.name }}</option>
+              {% endfor %}
+            </select>
+          </th>
+          <th>
+            <select name="to_warehouse_id" form="movementFiltersForm" class="form-select form-select-sm" onchange="this.form.submit()">
+              <option value="">Все</option>
+              {% for wh in to_warehouses %}
+              <option value="{{ wh.id }}" {% if request.args.get('to_warehouse_id') == wh.id|string %}selected{% endif %}>
+                {{ wh.marketplace_label() + ' ' if wh.marketplace else '' }}{{ wh.name }}
+              </option>
+              {% endfor %}
+            </select>
+          </th>
+          <th></th>
+          <th></th>
+          <th>
+            <select name="created_by_id" form="movementFiltersForm" class="form-select form-select-sm" onchange="this.form.submit()">
+              <option value="">Все</option>
+              {% for user in authors %}
+              <option value="{{ user.id }}" {% if request.args.get('created_by_id') == user.id|string %}selected{% endif %}>{{ user.display_name() }}</option>
+              {% endfor %}
+            </select>
+          </th>
+          <th>
+            <select name="status" form="movementFiltersForm" class="form-select form-select-sm" onchange="this.form.submit()">
+              <option value="">Все</option>
+              <option value="draft" {% if request.args.get('status') == 'draft' %}selected{% endif %}>На сборке</option>
+              <option value="collected" {% if request.args.get('status') == 'collected' %}selected{% endif %}>Собрано</option>
+              <option value="completed" {% if request.args.get('status') == 'completed' %}selected{% endif %}>Завершено</option>
+              <option value="merged" {% if request.args.get('status') == 'merged' %}selected{% endif %}>Объединено</option>
+            </select>
+          </th>
+          <th></th>
+          <th></th>
+          <th>
+            <select name="mp_request" form="movementFiltersForm" class="form-select form-select-sm" onchange="this.form.submit()">
+              <option value="">Все</option>
+              <option value="yes" {% if request.args.get('mp_request') == 'yes' %}selected{% endif %}>Есть заявка</option>
+              <option value="no" {% if request.args.get('mp_request') == 'no' %}selected{% endif %}>Нет заявки</option>
+            </select>
+          </th>
+          <th></th>
+          <th></th>
+          {% if current_user.is_admin %}<th></th>{% endif %}
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for d in documents %}
+        {% set can_manage_document = current_user.is_admin or d.created_by_id == current_user.id %}
+        {% set mp = d.to_warehouse.marketplace if d.to_warehouse else none %}
+        <tr class="{{ 'mp-row-wb' if mp == 'wb' else 'mp-row-ozon' if mp == 'ozon' else '' }}">
+          <td><input type="checkbox" class="form-check-input doc-checkbox" data-status="{{ d.status }}" name="doc_ids" value="{{ d.id }}"></td>
+          <td>
+            <a class="movement-number text-decoration-none" href="{{ url_for('movement.detail', doc_id=d.id) }}">{{ d.number }}</a>
+            {% if d.sync_warning %}
+              <span class="text-danger" title="1С создала документ не полностью — часть строк не сопоставлена с номенклатурой и пропущена: {{ d.sync_warning }}">⚠️</span>
+            {% endif %}
+          </td>
+          <td>{{ (d.created_at|msk).strftime('%d.%m.%Y %H:%M') }}</td>
+          <td>{{ d.from_warehouse.name }}</td>
+          <td>{% if d.to_warehouse.marketplace %}<span class="badge bg-secondary">{{ d.to_warehouse.marketplace_label() }}</span> {% endif %}{{ d.to_warehouse.name }}</td>
+          <td>{{ d.lines.count() }}</td>
+          {% set tq = d.total_sent_qty() %}
+          <td>
+            {{ tq | int if tq == tq | int else tq | round(3) }}
+            {% if d.received_at %}
+              {% set accepted_qty = d.total_received_qty() %}
+              <span title="Фактически принято на маркетплейсе">({{ accepted_qty | int if accepted_qty == accepted_qty | int else accepted_qty | round(3) }})</span>
+            {% endif %}
+          </td>
+          <td>{{ d.created_by.display_name() if d.created_by else '' }}</td>
+          <td>
+            {% if d.status == 'merged' %}
+              <span class="badge badge-status-merged">Объединен</span>
+              {% if d.merged_into %}<br><a class="small" href="{{ url_for('movement.detail', doc_id=d.merged_into_id) }}">→ {{ d.merged_into.number }}</a>{% endif %}
+            {% else %}
+              <span class="status-chips" role="group" aria-label="Статус перемещения">
+                <span class="status-chip status-chip-wide status-chip-onassembly status-chip-reached"
+                      title="На сборке: {{ (d.created_at|msk).strftime('%d.%m.%Y %H:%M') }}">Сб</span>
+                <span class="status-chip status-chip-wide status-chip-assembled{{ ' status-chip-reached' if d.status in ('collected', 'completed') else '' }}"
+                      title="Собрано: {{ (d.completed_at|msk).strftime('%d.%m.%Y %H:%M') if d.completed_at else 'еще не наступило' }}">Со</span>
+                <span class="status-chip status-chip-wide status-chip-requested{{ ' status-chip-reached' if d.marketplace_request_created_at and d.marketplace_request_number else '' }}"
+                      title="Создана заявка: {{ (d.marketplace_request_created_at|msk).strftime('%d.%m.%Y %H:%M') if d.marketplace_request_created_at else 'еще не наступило' }}">Зя</span>
+                <span class="status-chip status-chip-wide status-chip-shipped{{ ' status-chip-reached' if d.shipped_at else '' }}"
+                      title="Транспорт забрал: {{ (d.shipped_at|msk).strftime('%d.%m.%Y %H:%M') if d.shipped_at else 'еще не наступило' }}">От</span>
+                <span class="status-chip status-chip-wide status-chip-accepted{{ ' status-chip-reached' if d.received_at else '' }}"
+                      title="Принято на МП: {{ (d.received_at|msk).strftime('%d.%m.%Y %H:%M') if d.received_at else 'еще не наступило' }}">Пр</span>
+              </span>
+              {% if d.total_shortage_qty() %}<span class="badge bg-warning text-dark">Недовоз {{ d.total_shortage_qty() | qty }}</span>{% endif %}{% if d.total_excess_qty() %}<span class="badge bg-info text-dark">Излишек {{ d.total_excess_qty() | qty }}</span>{% endif %}
+            {% endif %}
+          </td>
+          <td class="text-nowrap">
+            {% if d.status != 'completed' %}
+              <span class="text-muted">—</span>
+            {% elif d.received_at %}
+              <span class="badge bg-success" title="{{ (d.received_at|msk).strftime('%d.%m.%Y %H:%M') }}">Принято МП {{ (d.received_at|msk).strftime('%d.%m') }}</span>
+            {% else %}
+              {% if d.is_waiting_marketplace_request() %}
+              <span class="badge bg-secondary fw-bold">{{ d.transit_status_label() }}</span>
+              {% else %}
+              <span class="text-warning-emphasis small">{{ d.transit_status_label() }}</span>
+              {% endif %}
+              {% if current_user.can_receive_movements() and d.shipped_at %}
+              <a class="btn btn-sm btn-warning movement-receive-btn text-decoration-none" href="{{ url_for('movement.receive', doc_id=d.id) }}"
+                 title="Зафиксировать количество, принятое маркетплейсом">📥 Принято на МП</a>
+              {% endif %}
+            {% endif %}
+          </td>
+          {% if one_c_integration_enabled %}<td class="text-center">
+            {% if can_manage_document %}
+            <button type="button" class="btn btn-sm btn-link p-0 toggle-flag-btn" style="font-size:1.15rem; line-height:1; text-decoration:none;"
+                  data-url="{{ url_for('movement.toggle_accounting', doc_id=d.id) }}"
+                  data-on-icon="✅" data-off-icon="☐"
+                  data-on-title-prefix="Внесено в 1С бухгалтерией "
+                  data-off-title="Отметить: бухгалтерия внесла документ в 1С"
+                  title="{{ 'Внесено в 1С бухгалтерией ' + (d.accounting_entered_at|msk).strftime('%d.%m.%Y %H:%M') if d.accounting_entered_at else 'Отметить: бухгалтерия внесла документ в 1С' }}"
+                  >{{ '✅' if d.accounting_entered_at else '☐' }}</button>
+            {% else %}
+              {{ '✅' if d.accounting_entered_at else '☐' }}
+            {% endif %}
+          </td>{% endif %}
+          <td class="text-center">
+            <button type="button" class="btn btn-sm btn-link p-0 text-primary toggle-flag-btn" style="font-size:1.15rem; line-height:1; text-decoration:none;"
+                  data-url="{{ url_for('movement.toggle_marketplace_request', doc_id=d.id) }}"
+                  data-on-icon="✔" data-off-icon="☐"
+                  data-on-title-prefix="Заявка на МП создана "
+                  data-off-title="{{ 'Отметить: заявка на маркетплейс создана' if d.marketplace_request_number else 'Сначала внесите номер заявки на МП' }}"
+                  title="{{ 'Заявка на МП создана ' + (d.marketplace_request_created_at|msk).strftime('%d.%m.%Y %H:%M') if d.marketplace_request_created_at else ('Отметить: заявка на маркетплейс создана' if d.marketplace_request_number else 'Сначала внесите номер заявки на МП') }}"
+                  {% if not d.marketplace_request_number and not d.marketplace_request_created_at %}disabled{% endif %}
+                  >{{ '✔' if d.marketplace_request_created_at else '☐' }}</button>
+          </td>
+          <td style="min-width:100px">
+            <div class="d-flex flex-nowrap gap-1">
+              <input type="text" name="marketplace_request_number" form="mpReqForm{{ d.id }}" value="{{ d.marketplace_request_number or '' }}" class="form-control form-control-sm" style="width:100px" placeholder="№ заявки">
+              <button type="submit" form="mpReqForm{{ d.id }}" class="btn btn-sm btn-outline-secondary">✓</button>
+            </div>
+          </td>
+          <td style="min-width:130px">
+            <div class="d-flex flex-nowrap gap-1">
+              <input type="date" name="delivery_slot_date" form="deliveryDateForm{{ d.id }}" value="{{ d.delivery_slot_date.isoformat() if d.delivery_slot_date else '' }}" class="form-control form-control-sm" style="width:130px">
+              <button type="submit" form="deliveryDateForm{{ d.id }}" class="btn btn-sm btn-outline-secondary">✓</button>
+            </div>
+          </td>
+          {% if current_user.is_admin %}
+          <td class="text-center">
+            {% set can_toggle_shipped = d.status == 'completed' and d.marketplace_request_created_at and d.marketplace_request_number %}
+            <button type="button" class="btn btn-sm btn-link p-0 text-primary toggle-flag-btn" style="font-size:1.15rem; line-height:1; text-decoration:none;"
+                  data-url="{{ url_for('movement.toggle_shipped', doc_id=d.id) }}"
+                  data-on-icon="✅" data-off-icon="☐"
+                  data-on-title-prefix="Передано транспорту "
+                  data-off-title="Отметить: транспорт забрал товар"
+                  title="{% if d.shipped_at %}Передано транспорту {{ (d.shipped_at|msk).strftime('%d.%m.%Y %H:%M') }}{% elif can_toggle_shipped %}Отметить: транспорт забрал товар{% else %}Сначала завершите перемещение, внесите номер и отметьте заявку на МП{% endif %}"
+                  {% if not can_toggle_shipped or d.received_at %}disabled{% endif %}
+                  >{{ '✅' if d.shipped_at else '☐' }}</button>
+          </td>
+          {% endif %}
+          <td>
+            <a href="{{ url_for('movement.export_document', doc_id=d.id) }}">Excel</a>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="{{ 15 if current_user.is_admin else 14 }}" class="text-muted">Перемещений еще нет</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </form>
+
+  <!-- Компактный список для телефона: только то, что нужно кладовщику на
+       ходу — номер (открывается по нему же), маршрут, статус, приемка. -->
+  <div class="list-group d-md-none">
+    {% for d in documents %}
+      {% set mp = d.to_warehouse.marketplace if d.to_warehouse else none %}
+      <a href="{{ url_for('movement.detail', doc_id=d.id) }}"
+         class="list-group-item list-group-item-action py-2 px-2 movement-list-item text-decoration-none text-body {{ 'mp-row-wb' if mp == 'wb' else 'mp-row-ozon' if mp == 'ozon' else '' }}">
+        <div class="d-flex justify-content-between align-items-center gap-2">
+          <span class="fw-bold">{{ d.number }}</span>
+          {% if d.status == 'merged' %}
+            <span class="badge badge-status-merged">Объединен</span>
+          {% elif d.received_at %}
+            <span class="badge status-chip-accepted">Принято МП</span>
+          {% elif d.shipped_at %}
+            <span class="badge status-chip-shipped">В пути</span>
+          {% elif d.marketplace_request_created_at and d.marketplace_request_number %}
+            <span class="badge status-chip-requested">Создана заявка</span>
+          {% elif d.status in ('collected', 'completed') %}
+            <span class="badge status-chip-assembled">Собрано</span>
+          {% else %}
+            <span class="badge status-chip-onassembly">На сборке</span>
+          {% endif %}
+        </div>
+        <div class="small text-muted">{{ d.from_warehouse.name }} → {% if d.to_warehouse.marketplace %}<span class="badge bg-secondary">{{ d.to_warehouse.marketplace_label() }}</span> {% endif %}{{ d.to_warehouse.name }}</div>
+        {% set mobile_total_qty = d.total_sent_qty() %}
+        <div class="small text-muted">{{ (d.created_at|msk).strftime('%d.%m.%Y') }} · {{ d.lines.count() }} короб. · {{ mobile_total_qty | int if mobile_total_qty == mobile_total_qty | int else mobile_total_qty | round(3) }} шт.{% if d.received_at %}{% set mobile_accepted_qty = d.total_received_qty() %} (принято {{ mobile_accepted_qty | int if mobile_accepted_qty == mobile_accepted_qty | int else mobile_accepted_qty | round(3) }}){% endif %}{% if d.created_by %} · Автор: {{ d.created_by.display_name() }}{% endif %}</div>
+        {% if d.status == 'completed' and not d.received_at %}
+          <div class="mt-1">
+            {% if d.is_waiting_marketplace_request() %}
+            <span class="badge bg-secondary fw-bold">{{ d.transit_status_label() }}</span>
+            {% else %}
+            <span class="text-warning-emphasis small">{{ d.transit_status_label() }}</span>
+            {% endif %}
+          </div>
+        {% endif %}
+      </a>
+    {% else %}
+      <div class="list-group-item text-muted">Перемещений еще нет</div>
+    {% endfor %}
+  </div>
+
+  {% if pagination.pages > 1 %}
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mt-3">
+    <div class="text-muted small">Страница {{ pagination.page }} из {{ pagination.pages }} · всего перемещений: {{ pagination.total }}</div>
+    <div class="d-flex gap-2">
+      {% set search_args = {} %}
+      {% for param in ("q", "mp_request", "number", "from_warehouse_id", "to_warehouse_id", "created_by_id", "status", "date_from", "date_to") %}
+        {% if request.args.get(param) %}{% set _ = search_args.update({param: request.args.get(param)}) %}{% endif %}
+      {% endfor %}
+      {% if pagination.has_prev %}
+        {% if request.endpoint == 'movement.route_box' %}
+          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('movement.route_box', page=pagination.prev_num, box_number=route_box_number, **search_args) }}">&larr; Назад</a>
+        {% elif request.endpoint == 'movement.find_box' %}
+          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('movement.find_box', page=pagination.prev_num, box_number=find_box_number, **search_args) }}">&larr; Назад</a>
+        {% else %}
+          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('movement.list_documents', page=pagination.prev_num, **search_args) }}">&larr; Назад</a>
+        {% endif %}
+      {% endif %}
+      {% if pagination.has_next %}
+        {% if request.endpoint == 'movement.route_box' %}
+          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('movement.route_box', page=pagination.next_num, box_number=route_box_number, **search_args) }}">Вперед &rarr;</a>
+        {% elif request.endpoint == 'movement.find_box' %}
+          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('movement.find_box', page=pagination.next_num, box_number=find_box_number, **search_args) }}">Вперед &rarr;</a>
+        {% else %}
+          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('movement.list_documents', page=pagination.next_num, **search_args) }}">Вперед &rarr;</a>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Номер короба сканируется так же, как товар (Enter или пауза в наборе) —
+  // не нужно жать "Найти" каждый раз, чтобы процесс сканирования/распределения
+  // коробов шел непрерывно.
+  const routeBoxInput = document.getElementById("routeBoxInput");
+  if (routeBoxInput) {
+    initBarcodeInput(
+      routeBoxInput,
+      (value) => {
+        routeBoxInput.value = value;
+        routeBoxInput.form.submit();
+      },
+      { debounceMs: 900 }
+    );
+  }
+
+  // Печать накладных доступна только когда выбран хотя бы один документ;
+  // "Выбрать все" отмечает/снимает все флажки разом. Объединение — только
+  // когда выбрано минимум два документа и ВСЕ они черновики (иначе сервер
+  // все равно откажет — здесь просто чтобы не тыкаться в заведомо
+  // невалидную кнопку).
+  const selectAllDocs = document.getElementById("selectAllDocs");
+  const docCheckboxes = Array.from(document.querySelectorAll(".doc-checkbox"));
+  const printWaybillsBtn = document.getElementById("printWaybillsBtn");
+  const printLabelsBtn = document.getElementById("printLabelsBtn");
+  const mergeDocsBtn = document.getElementById("mergeDocsBtn");
+  const selectedDocsCount = document.getElementById("selectedDocsCount");
+  const selectedDocsCount2 = document.getElementById("selectedDocsCount2");
+  const selectedDocsCount3 = document.getElementById("selectedDocsCount3");
+  const changeDestBtn = document.getElementById("changeDestBtn");
+  const newDestSelect = document.getElementById("newDestSelect");
+  const selectedDocsCount4 = document.getElementById("selectedDocsCount4");
+
+  function updatePrintButtonState() {
+    const checked = docCheckboxes.filter((cb) => cb.checked);
+    const checkedCount = checked.length;
+    [printWaybillsBtn, printLabelsBtn].forEach((btn) => {
+      btn.disabled = checkedCount === 0;
+      btn.classList.toggle("btn-outline-secondary", checkedCount === 0);
+      btn.classList.toggle("btn-primary", checkedCount > 0);
+    });
+    selectedDocsCount.textContent = checkedCount;
+    selectedDocsCount2.textContent = checkedCount;
+    if (changeDestBtn) {
+      changeDestBtn.disabled = checkedCount === 0 || !newDestSelect.value;
+      changeDestBtn.classList.toggle("btn-outline-secondary", changeDestBtn.disabled);
+      changeDestBtn.classList.toggle("btn-primary", !changeDestBtn.disabled);
+      selectedDocsCount4.textContent = checkedCount;
+    }
+    if (mergeDocsBtn) {
+      const allDrafts = checked.every((cb) => cb.dataset.status === "draft");
+      mergeDocsBtn.disabled = checkedCount < 2 || !allDrafts;
+      mergeDocsBtn.classList.toggle("btn-outline-secondary", mergeDocsBtn.disabled);
+      mergeDocsBtn.classList.toggle("btn-primary", !mergeDocsBtn.disabled);
+      selectedDocsCount3.textContent = checkedCount;
+    }
+  }
+
+  if (newDestSelect) newDestSelect.addEventListener("change", updatePrintButtonState);
+
+  if (selectAllDocs) {
+    selectAllDocs.addEventListener("change", () => {
+      docCheckboxes.forEach((cb) => { cb.checked = selectAllDocs.checked; });
+      updatePrintButtonState();
+    });
+  }
+  docCheckboxes.forEach((cb) => cb.addEventListener("change", () => {
+    if (!cb.checked) selectAllDocs.checked = false;
+    updatePrintButtonState();
+  }));
+
+  // Галочка 1С — пометка для контроля. Галочка «Заявка на МП» дополнительно
+  // требует сохраненного номера заявки; сервер повторно проверяет это условие.
+  document.querySelectorAll(".toggle-flag-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      btn.disabled = true;
+      fetch(btn.dataset.url, { method: "POST" })
+        .then((r) => r.json())
+        .then((data) => {
+          if (!data.ok) {
+            if (data.error) window.alert(data.error);
+            return;
+          }
+          btn.textContent = data.checked ? btn.dataset.onIcon : btn.dataset.offIcon;
+          btn.title = data.checked ? btn.dataset.onTitlePrefix + data.at : btn.dataset.offTitle;
+        })
+        .finally(() => { btn.disabled = false; });
+    });
+  });
+
+</script>
+{% endblock %}

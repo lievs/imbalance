@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}Склады{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4">
+  <h3 class="mb-0">Склады</h3>
+  <div class="d-flex flex-wrap gap-2">
+    <a class="btn btn-outline-secondary" href="{{ url_for('boxes.list_boxes') }}">📋 Список коробов</a>
+    <a class="btn btn-outline-secondary" href="{{ url_for('boxes.bulk_create') }}">📦 Массовое создание коробов</a>
+  </div>
+</div>
+
+<div class="row g-4">
+  <div class="col-md-5">
+    <div class="card p-3">
+      <h5 class="d-flex align-items-center gap-2">
+        Добавить склад
+        <button type="button" class="hint-icon d-md-none" data-bs-toggle="popover" data-bs-trigger="focus"
+                data-bs-placement="bottom" data-bs-content="Код склада присваивается автоматически (WH-001, WH-002, ...)."
+                aria-label="Подсказка">?</button>
+      </h5>
+      <p class="text-muted small d-none d-md-block">Код склада присваивается автоматически (WH-001, WH-002, ...).</p>
+      <form method="post" action="{{ url_for('warehouses.create_warehouse') }}">
+        <div class="mb-2">
+          <label class="form-label">Наименование</label>
+          <input type="text" name="name" class="form-control" required placeholder="Основной склад">
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Адрес</label>
+          <input type="text" name="address" class="form-control">
+        </div>
+        <button type="submit" class="btn btn-primary">Создать</button>
+      </form>
+    </div>
+  </div>
+  <div class="col-md-7">
+    <div class="card p-3">
+      <h5>Список складов</h5>
+      <table class="table d-none d-md-table">
+        <thead><tr><th>Код</th><th>Наименование</th><th>Адрес</th><th>Статус</th><th>План отгрузок</th><th></th></tr></thead>
+        <tbody>
+        {% for wh in warehouses %}
+          <tr>
+            <td>{{ wh.code }}</td>
+            <td>{% if wh.marketplace %}<span class="badge bg-secondary">{{ wh.marketplace_label() }}</span> {% endif %}{{ wh.name }}</td>
+            <td>{{ wh.address or '' }}</td>
+            <td>{% if wh.is_active %}<span class="badge bg-success">Активен</span>{% else %}<span class="badge bg-secondary">Отключен</span>{% endif %}</td>
+            <td>
+              {% if wh.marketplace %}
+                {% if wh.in_current_plan %}
+                  <span class="badge bg-success">В текущем плане</span>
+                {% else %}
+                  <span class="badge bg-warning text-dark" title="Города нет в последней загруженной выгрузке — можно отключить склад">Нет в плане</span>
+                {% endif %}
+              {% else %}
+                <span class="text-muted">—</span>
+              {% endif %}
+            </td>
+            <td class="text-nowrap">
+              <a class="btn btn-sm btn-outline-primary" href="{{ url_for('warehouses.cells', warehouse_id=wh.id) }}">Ячейки</a>
+              <form method="post" action="{{ url_for('warehouses.toggle_warehouse', warehouse_id=wh.id) }}" class="d-inline">
+                <button type="submit" class="btn btn-sm btn-outline-secondary">{{ 'Отключить' if wh.is_active else 'Включить' }}</button>
+              </form>
+              {% if current_user.is_admin and wh.marketplace %}
+              <form method="post" action="{{ url_for('warehouses.delete_warehouse', warehouse_id=wh.id) }}" class="d-inline"
+                    onsubmit="return confirm('Удалить склад «{{ wh.marketplace_label() }} · {{ wh.name }}» и его строки плана? Действие нельзя отменить.')">
+                <button type="submit" class="btn btn-sm btn-outline-danger">Удалить</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6" class="text-muted">Склады еще не созданы</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+
+      <div class="list-group d-md-none">
+        {% for wh in warehouses %}
+          <div class="list-group-item py-2 px-2">
+            <div class="d-flex justify-content-between align-items-center gap-2">
+              <a href="{{ url_for('warehouses.cells', warehouse_id=wh.id) }}" class="fw-bold text-decoration-none">{{ wh.code }} — {% if wh.marketplace %}{{ wh.marketplace_label() }} · {% endif %}{{ wh.name }}</a>
+              {% if wh.is_active %}<span class="badge bg-success">Активен</span>{% else %}<span class="badge bg-secondary">Отключен</span>{% endif %}
+            </div>
+            {% if wh.address %}<div class="small text-muted">{{ wh.address }}</div>{% endif %}
+            <div class="d-flex justify-content-between align-items-center mt-1 gap-2">
+              <div>
+                {% if wh.marketplace %}
+                  {% if wh.in_current_plan %}
+                    <span class="badge bg-success">В текущем плане</span>
+                  {% else %}
+                    <span class="badge bg-warning text-dark">Нет в плане</span>
+                  {% endif %}
+                {% endif %}
+              </div>
+              <div class="d-flex flex-wrap justify-content-end gap-1">
+                <form method="post" action="{{ url_for('warehouses.toggle_warehouse', warehouse_id=wh.id) }}">
+                  <button type="submit" class="btn btn-sm btn-outline-secondary">{{ 'Отключить' if wh.is_active else 'Включить' }}</button>
+                </form>
+                {% if current_user.is_admin and wh.marketplace %}
+                <form method="post" action="{{ url_for('warehouses.delete_warehouse', warehouse_id=wh.id) }}"
+                      onsubmit="return confirm('Удалить склад «{{ wh.marketplace_label() }} · {{ wh.name }}» и его строки плана? Действие нельзя отменить.')">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">Удалить</button>
+                </form>
+                {% endif %}
+              </div>
+            </div>
+          </div>
+        {% else %}
+          <div class="list-group-item text-muted">Склады еще не созданы</div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if one_c_integration_enabled and current_user.can_manage_warehouse_mapping() %}
+{% set hint_fulfillment_1c = "Сопоставление задается отдельно для каждого склада. Для склада-города маркетплейса пустое поле использует общий запасной склад 1С, для собственного склада — его название из WMS." %}
+<div class="card p-3 mt-4">
+  <h5>Сопоставление складов с 1С</h5>
+  <p class="text-muted small">{{ hint_fulfillment_1c }}</p>
+  <table class="table table-sm table-mobile-compact mb-0">
+    <thead><tr><th>Склад WMS</th><th>Склад в 1С</th></tr></thead>
+    <tbody>
+    {% for wh in own_mapping_warehouses %}
+      <tr>
+        <td><span class="badge bg-primary">Свой склад</span> {{ wh.name }}</td>
+        <td style="min-width:340px">
+          <form method="post" action="{{ url_for('warehouses.update_fulfillment_1c_name', warehouse_id=wh.id) }}" class="d-flex gap-1">
+            <input type="text" name="fulfillment_1c_name" value="{{ wh.fulfillment_1c_name or '' }}" class="form-control form-control-sm" placeholder="Название склада в 1С (пусто — как в WMS)">
+            <button type="submit" class="btn btn-sm btn-outline-secondary">Сохранить</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    {% for wh in fulfillment_warehouses %}
+      <tr>
+        <td><span class="badge bg-secondary">{{ wh.marketplace_label() }}</span> {{ wh.name }}</td>
+        <td style="min-width:340px">
+          <form method="post" action="{{ url_for('warehouses.update_fulfillment_1c_name', warehouse_id=wh.id) }}" class="d-flex gap-1">
+            <input type="text" name="fulfillment_1c_name" value="{{ wh.fulfillment_1c_name or '' }}" class="form-control form-control-sm" placeholder="Товары в пути ФФ ...">
+            <button type="submit" class="btn btn-sm btn-outline-secondary">Сохранить</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="2" class="text-muted">Складов-городов маркетплейсов еще нет</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

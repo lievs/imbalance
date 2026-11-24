@@ -1,0 +1,303 @@
+body {
+  background-color: #f5f6f8;
+}
+
+.card {
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.stat-card .value {
+  font-size: 2rem;
+  font-weight: 700;
+}
+
+/* Строка фильтров над колонками (movement/list.html) — чуть светлее
+   шапки таблицы, компактные отступы, чтобы не раздувать высоту заголовка. */
+.movement-filter-row th {
+  background-color: #fafbfc;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  font-weight: normal;
+}
+.movement-filter-row .form-select,
+.movement-filter-row .form-control {
+  font-size: 0.8rem;
+}
+
+.autocomplete-box {
+  position: relative;
+}
+
+.autocomplete-list {
+  position: absolute;
+  z-index: 1000;
+  top: 100%;
+  left: 0;
+  right: 0;
+  max-height: 280px;
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid #ced4da;
+  border-top: none;
+  border-radius: 0 0 .375rem .375rem;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
+  display: none;
+}
+
+.autocomplete-list.show {
+  display: block;
+}
+
+.autocomplete-item {
+  padding: .5rem .75rem;
+  cursor: pointer;
+}
+
+.autocomplete-item:hover,
+.autocomplete-item.active {
+  background-color: #e9ecef;
+}
+
+.badge-status-draft { background-color: #ffc107; color: #000; }
+.badge-status-recounting { background-color: #fd7e14; color: #000; }
+.badge-status-sorting { background-color: #6610f2; }
+.badge-status-completed { background-color: #198754; }
+.badge-status-open { background-color: #6c757d; }
+.badge-status-stored { background-color: #0d6efd; }
+.badge-status-merged { background-color: #6c757d; }
+
+/* Плашки статусов приемки (черновик/пересчет/разбраковка/завершено) —
+   4 небольшие плашки рядом вместо одного бейджа, чтобы по цвету видеть,
+   до какого этапа дошел документ, а по подсказке при наведении — дату
+   перехода (для сравнения скорости прохождения этапов между приемками). */
+.status-chips { display: inline-flex; gap: 3px; vertical-align: middle; }
+.status-chip {
+  display: inline-block;
+  min-width: 1.5em;
+  height: 1.5em;
+  line-height: 1.5em;
+  padding: 0 .25em;
+  border-radius: .25rem;
+  font-size: .7rem;
+  font-weight: 600;
+  text-align: center;
+  color: #fff;
+  opacity: .35;
+  cursor: default;
+}
+.status-chip.status-chip-reached { opacity: 1; }
+.status-chip-draft { background-color: #6c757d; }
+.status-chip-recounting { background-color: #fd7e14; }
+.status-chip-sorting { background-color: #ffc107; color: #000; }
+.status-chip-completed { background-color: #198754; }
+
+/* Плашки статусов перемещения (на сборке/собрано/создана заявка/
+   отгружено) — тот же принцип, что и у приемки выше, только чуть шире
+   (двухбуквенные подписи вместо одной буквы, лучше читаются в списке). */
+.status-chip-wide { min-width: 2.4em; }
+.status-chip-onassembly { background-color: #6c757d; }
+.status-chip-assembled { background-color: #fd7e14; }
+.status-chip-requested { background-color: #ffc107; color: #000; }
+.status-chip-shipped { background-color: #198754; }
+.status-chip-accepted { background-color: #0d6efd; }
+
+/* Список перемещений: строка окрашивается по маркетплейсу склада
+   назначения — визуально отличить ВБ от Озон, не открывая документ.
+   Светлые пастельные оттенки — прежние сплошные #9E77C5/#3396ff на белом
+   тексте были еще ярче темных #9F69D6/#594CD8, которые и заменяли (см.
+   чат), на целую строку это слишком "кричит". Текст/ссылки здесь уже
+   темные (обычные), отдельно красить не нужно.
+   Фон нужен именно на >td (не только на самой tr) и с !important — у
+   Bootstrap 5 каждая ячейка таблицы красит СВОЙ фон через переменную
+   --bs-table-bg с более высокой специфичностью (.table>:not(caption)>*>*),
+   и он перекрывает фон, поставленный только на <tr>. */
+.mp-row-wb, .mp-row-wb > td { background-color: #f1eaf8 !important; }
+.mp-row-ozon, .mp-row-ozon > td { background-color: #e3f0ff !important; }
+
+/* Рекомендованная строка в "Куда везти короб" (movement/list.html) — обычный
+   Bootstrap table-success слишком яркий (насыщенный зеленый) на целую
+   строку, см. чат. Фон светлее и чуть приглушенный. */
+.route-recommended-row, .route-recommended-row > td { background-color: #eaf6ee !important; }
+
+/* ---- Мобильный экран ---- */
+
+/* Широкие таблицы не должны ломать верстку на телефоне — скроллим по горизонтали */
+@media (max-width: 767.98px) {
+  /* Меньше пустого пространства от верхнего меню до содержимого и между
+     основными блоками мобильных списков. */
+  .navbar.mb-4 {
+    margin-bottom: .75rem !important;
+  }
+
+  .mobile-compact-list-page > .mb-4,
+  .mobile-compact-list-page > .mb-3 {
+    margin-bottom: .75rem !important;
+  }
+
+  /* На телефоне оставляем экрану больше полезной ширины: стандартные
+     боковые поля Bootstrap здесь визуально слишком велики. */
+  .app-content {
+    padding-left: .5rem !important;
+    padding-right: .5rem !important;
+  }
+
+  /* Компактнее отступы вокруг списков перемещений и приемок, а также
+     внутри каждой строки. */
+  .movement-list-card,
+  .receiving-list-card {
+    padding-top: .5rem !important;
+    padding-left: .5rem !important;
+    padding-right: .5rem !important;
+    padding-bottom: .5rem !important;
+  }
+
+  .movement-list-item,
+  .receiving-list-item {
+    padding-top: .375rem !important;
+    padding-left: .375rem !important;
+    padding-right: .375rem !important;
+    padding-bottom: .375rem !important;
+  }
+
+  .card .table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Крупнее тап-зоны на маленьком экране */
+  .btn {
+    min-height: 38px;
+  }
+
+  h3 {
+    font-size: 1.35rem;
+  }
+}
+
+/* Маленький значок "?" — по нажатию показывает подсказку всплывающим
+   попапом (см. app.js), вместо того чтобы держать текст подсказки
+   постоянно на экране (особенно важно на мобильном, где место в цене) */
+.hint-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.15rem;
+  height: 1.15rem;
+  padding: 0;
+  font-size: .7rem;
+  line-height: 1;
+  border-radius: 50%;
+  border: 1px solid #adb5bd;
+  color: #6c757d;
+  background: #fff;
+  flex: 0 0 auto;
+}
+
+@media (max-width: 767.98px) {
+  /* Компактные табличные части на мобильном — меньше отступов и шрифт помельче */
+  .table-mobile-compact {
+    font-size: .8rem;
+  }
+  .table-mobile-compact th,
+  .table-mobile-compact td {
+    padding: .35rem .5rem;
+  }
+
+  /* По умолчанию широкие таблицы на мобильном скроллятся по горизонтали
+     через display:block+overflow-x:auto на ".card .table" выше — этого
+     достаточно приоритета (2 класса в селекторе), чтобы просто повторить
+     white-space тут не сработало (замечено на реальном скриншоте: текст
+     обрубался, а не переносился). Поэтому здесь селектор с тем же
+     ".card .table" + свой класс — и отключаем скролл-бокс явно. Обычная
+     (не table-layout:fixed) раскладка при ширине 100% сама сжимает
+     колонки и переносит текст по словам, где не хватает места —
+     table-layout:fixed пробовали сначала, но он делит ширину поровну
+     между колонками и рвет длинные слова заголовков посередине. Годится
+     только для таблиц без интерактивных элементов в ячейках (инлайн-формы
+     с кнопками/полями при сжатии колонки съезжают — см. table-mobile-compact
+     без этого класса для таких таблиц). */
+  .card .table.table-allow-wrap {
+    display: table;
+    width: 100%;
+    overflow-x: visible;
+    white-space: normal;
+  }
+}
+
+/* Кнопка камеры рядом с полем сканирования — не должна сжиматься */
+[data-camera-scan-target] {
+  flex: 0 0 auto;
+}
+
+#cameraScanReader video {
+  width: 100% !important;
+  border-radius: .375rem;
+}
+
+/* ---- Печать этикеток 58x40мм ---- */
+@page {
+  size: 58mm 40mm;
+  margin: 0;
+}
+
+.label-page {
+  width: 58mm;
+  height: 40mm;
+  box-sizing: border-box;
+  padding: 2mm;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  page-break-after: always;
+  font-family: Arial, Helvetica, sans-serif;
+  text-align: center;
+}
+
+.label-page img {
+  max-width: 100%;
+  max-height: 20mm;
+}
+
+/* Штрихкод на этикетке короба — крупнее обычного (легче сканировать,
+   в т.ч. при смазанной печати) */
+.label-page img.label-img-lg {
+  max-height: 26mm;
+}
+
+.label-page .label-title {
+  font-size: 9pt;
+  font-weight: 700;
+  line-height: 1.15;
+  margin-top: 1mm;
+  word-break: break-word;
+}
+
+/* Номер короба на этикетке короба — крупнее обычного .label-title
+   (используется только там, а не на этикетках товара/ячейки, где текст
+   бывает длиннее и не поместится настолько крупным шрифтом) */
+.label-page .label-title.label-title-lg {
+  font-size: 15pt;
+}
+
+.label-page .label-subtitle {
+  font-size: 7.5pt;
+  color: #333;
+  margin-top: 0.5mm;
+}
+
+.no-print {
+  margin: 1rem;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #fff;
+  }
+}

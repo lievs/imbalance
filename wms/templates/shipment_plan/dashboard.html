@@ -1,0 +1,629 @@
+{% extends "base.html" %}
+{% block title %}План отгрузок{% endblock %}
+{% block extra_head %}
+<style>
+  /* Заголовок таблицы "Что нужно отправить" остается на виду при
+     прокрутке длинного списка товаров — .table-responsive у Bootstrap не
+     мешает этому, пока у нее не задана своя высота (см. чат). */
+  #picking-picking thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  #picking-picking thead th:not(.table-info):not(.table-warning) {
+    background-color: #fff;
+  }
+  #picking-picking .picking-toggle {
+    display: inline-block;
+    width: 1em;
+    cursor: pointer;
+    user-select: none;
+  }
+  #picking-picking .picking-group-row {
+    cursor: pointer;
+  }
+  /* «% вып.» в таблице городов — группа: по умолчанию свернута (видно
+     только общий %), по кнопке ▸ разворачивается в колонки по складам-
+     отправителям (см. чат). Состояние держится классом на самой таблице,
+     а не на строках, поэтому не сбрасывается, когда строки городов
+     перерисовываются после смены «Даты плана». */
+  .city-table.senders-collapsed .sender-col {
+    display: none;
+  }
+  .city-table .senders-toggle {
+    cursor: pointer;
+    user-select: none;
+    border: 0;
+    background: none;
+    padding: 0 .25em;
+    color: #0d6efd;
+  }
+</style>
+{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4">
+  <h3 class="mb-0">План отгрузок</h3>
+  <div>
+    <a class="btn btn-outline-secondary d-none d-md-inline-block" href="{{ url_for('shipment_plan.export_all') }}">📊 Выгрузить в Excel</a>
+    {% if current_user.is_admin %}
+    {% if google_sync.configured %}
+    <form method="post" action="{{ url_for('shipment_plan.sync_google') }}" class="d-inline">
+      <button class="btn btn-primary" type="submit">🔄 Синхронизировать Google Таблицу</button>
+    </form>
+    {% endif %}
+    <a class="btn btn-outline-primary" href="{{ url_for('shipment_plan.google_button_setup') }}">Настроить кнопку в таблице</a>
+    <a class="btn btn-outline-primary" href="{{ url_for('shipment_plan.upload') }}">⬆ Загрузить файл</a>
+    {% endif %}
+  </div>
+</div>
+
+{% if current_user.is_admin and google_sync.configured %}
+<div class="alert {{ 'alert-danger' if google_sync.last_error else 'alert-info' }} py-2">
+  <b>Google Таблица:</b> данные обновляются только вручную — кнопкой в таблице или кнопкой выше.
+  {% if google_sync.running %}<br><b>⏳ Синхронизация выполняется в фоне…</b> страница обновится сама.{% endif %}
+  {% if google_sync.last_result and not google_sync.running %}<br>Результат последней синхронизации: {{ google_sync.last_result }}{% endif %}
+  {% if google_sync.last_sync_at %}Последнее успешное обновление: {{ google_sync.last_sync_at }}.{% endif %}
+  {% if google_sync.last_error %}<br>Ошибка: {{ google_sync.last_error }}{% endif %}
+  {% if google_sync.sheet_names %}
+  <br><span class="small text-muted">Листы с «Распределение», найденные в таблице при последней синхронизации: {{ google_sync.sheet_names }}</span>
+  {% endif %}
+</div>
+{% if google_sync.running %}
+<script>
+  (function poll() {
+    setTimeout(function () {
+      fetch("{{ url_for('shipment_plan.sync_google_status') }}", {headers: {"Accept": "application/json"}})
+        .then(function (r) { return r.json(); })
+        .then(function (d) { if (d.running) poll(); else location.reload(); })
+        .catch(function () { poll(); });
+    }, 4000);
+  })();
+</script>
+{% endif %}
+{% if google_sync.missing_marketplaces %}
+<div class="alert alert-danger py-2">
+  ⚠ На последней синхронизации НЕ найден подходящий лист «Распределение» для: <b>{{ google_sync.missing_marketplaces }}</b> —
+  план(ы) этой площадки остались прежними (не обновились). Проверьте название листа в Google Таблице — скорее всего,
+  его переименовали, удалили или в имени нет нужного маркера площадки («озон»/«вб»).
+</div>
+{% endif %}
+{% endif %}
+
+{% if summary.in_transit_by_marketplace %}
+<div class="card p-3 mb-4">
+  <h5 class="mb-2">Сводка</h5>
+  <div class="row g-3">
+    <div class="col-md-6">
+      <div class="text-muted small mb-1">В пути</div>
+      <table class="table table-sm mb-0" style="max-width:320px">
+        <tbody>
+        {% for row in summary.in_transit_by_marketplace %}
+          <tr><td>{{ row.label }}</td><td class="text-end">{{ row.qty | round(0) | int }}</td></tr>
+        {% endfor %}
+          <tr class="fw-bold"><td>Итого</td><td class="text-end">{{ summary.total_in_transit | round(0) | int }}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="col-md-6 d-flex flex-column gap-2 justify-content-center">
+      <div><span class="text-muted">На складе:</span> <b>{{ summary.total_stock | round(0) | int }}</b></div>
+      <div><span class="text-muted">На производстве</span> <span class="text-muted small">(с начала периода плана)</span>: <b>{{ summary.total_production | round(0) | int }}</b></div>
+      {% if summary.non_empty_boxes_by_warehouse %}
+      <div>
+        <span class="text-muted">Непустых коробов на складе</span>
+        <span class="text-muted small" title="Все непустые короба физически на складе — без привязки к плану, та же цифра, что и в выгрузке «Короба → Выгрузить непустые короба по складам»">(факт, не план)</span>:
+        {% for row in summary.non_empty_boxes_by_warehouse %}
+          {{ row.warehouse.name }} — <b>{{ row.count }}</b>{% if not loop.last %}, {% endif %}
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<div class="row g-3 mb-4">
+  {% for mp in marketplaces %}
+  <div class="col-md-6">
+    <div class="card p-3 h-100">
+      <h4>{{ mp.label }}</h4>
+      {% if not mp.plan %}
+        <p class="text-muted mb-0">План еще не загружен.</p>
+      {% else %}
+        <p class="text-muted small mb-2">
+          Лист «{{ mp.plan.sheet_name }}», загружен {{ (mp.plan.uploaded_at|msk).strftime('%d.%m.%Y %H:%M') }}
+          {% if mp.plan.uploaded_by %}({{ mp.plan.uploaded_by.display_name() }}){% endif %}
+        </p>
+        <p class="mb-2">
+          План <b>{{ mp.total_planned | round(0) | int }}</b> —
+          отгружено <b>{{ mp.total_fulfilled_with_transit | round(0) | int }}</b>,
+          в пути <b>{{ mp.total_in_transit | round(0) | int }}</b>
+          ({{ (100 * mp.total_fulfilled_with_transit / mp.total_planned) | round(1) if mp.total_planned else 0 }}%)
+          {% if mp.problems_count %}
+            — <span class="badge bg-danger">{{ mp.problems_count }} без остатка на складе</span>
+          {% endif %}
+        </p>
+
+        {% if not mp.pace %}
+          <p class="text-muted small">Не удалось определить дату начала периода из названия листа («{{ mp.plan.sheet_name }}») — темп не считаем.</p>
+        {% else %}
+          {% set pace = mp.pace %}
+          <div class="alert py-2 px-3 mb-2
+            {%- if pace.status == 'done' %} alert-success
+            {%- elif pace.status == 'on_track' %} alert-success
+            {%- elif pace.status == 'behind' %} alert-danger
+            {%- elif pace.status == 'overdue' %} alert-danger
+            {%- else %} alert-secondary{% endif %}">
+            <b>Период:</b> {{ mp.plan.period_start.strftime('%d.%m') }}–{{ pace.deadline.strftime('%d.%m') }}
+            (прошло {{ pace.days_elapsed }} дн., {% if pace.days_left > 0 %}осталось {{ pace.days_left }} дн.{% else %}срок истёк {{ -pace.days_left }} дн. назад{% endif %})
+            <br>
+            {% if pace.status == 'done' %}
+              ✅ План уже выполнен полностью.
+            {% elif pace.status == 'no_data' %}
+              ⏳ Пока нет отгрузок за период — темп посчитать не из чего.
+            {% elif pace.status == 'overdue' %}
+              ⚠ Срок (14 дней) истёк, а осталось отгрузить <b>{{ pace.remaining | round(0) | int }}</b> шт.
+            {% elif pace.status == 'on_track' %}
+              ✅ Успеваем — при темпе <b>{{ pace.rate | round(1) }} шт/день</b> на остаток ({{ pace.remaining | round(0) | int }} шт) уйдёт ещё
+              <b>~{{ pace.days_needed | round(1) }} дн.</b>, а времени до срока — {{ pace.days_left }} дн.
+            {% else %}
+              ⚠ Не успеваем при текущем темпе — <b>{{ pace.rate | round(1) }} шт/день</b> даёт
+              <b>~{{ pace.days_needed | round(1) }} дн.</b> на остаток ({{ pace.remaining | round(0) | int }} шт),
+              а до срока осталось {{ pace.days_left }} дн. Нужно ускориться минимум до
+              <b>{{ pace.required_rate | round(1) }} шт/день</b>.
+            {% endif %}
+          </div>
+        {% endif %}
+
+        <div class="table-responsive">
+        <table class="table table-sm table-mobile-compact mb-0 city-table senders-collapsed" data-senders-key="{{ mp.marketplace }}">
+          <thead><tr>
+            <th>Город</th>
+            <th title="Дата, к которой нужно отгрузить план по этому городу — проставляется вручную; факт под датой — нарастающим итогом с начала периода по эту дату включительно">Дата плана</th>
+            <th>План</th>
+            <th title="Все перемещения, которые транспорт забрал с 00:01 даты листа (принятые и еще едущие)">Отгружено</th>
+            <th title="Отгружено, но еще не подтверждено кнопкой «Принято на складе»">В пути</th>
+            <th title="Отгружено / план. Кнопка ▸ разворачивает вклад каждого склада-отправителя">% вып.
+              {% if sender_warehouses %}<button type="button" class="senders-toggle" title="Показать/скрыть разбивку по складам">▸</button>{% endif %}
+            </th>
+            {% for wh in sender_warehouses %}
+            <th class="sender-col" title="Вклад склада «{{ wh.name }}» в то, что уже уехало на этот город">{{ wh.name }}</th>
+            {% endfor %}
+          </tr></thead>
+          <tbody class="city-rows-body">
+          {% set plan = mp.plan %}
+          {% set cities = mp.cities %}
+          {% include "shipment_plan/_city_rows.html" %}
+          </tbody>
+        </table>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{% if picking_list %}
+<div class="card p-3 mb-4">
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <div class="d-flex align-items-center gap-2 flex-wrap">
+      <h5 class="mb-0">Что нужно отправить <span class="text-muted small">(осталось по плану, {{ picking_list|length }} поз., ОЗОН и ВБ вместе)</span></h5>
+      <div class="form-check mb-0">
+        <input type="checkbox" class="form-check-input" id="picking-collapse-all" data-picking-collapse-all="picking" checked>
+        <label class="form-check-label" for="picking-collapse-all">Свернуть все группы</label>
+      </div>
+    </div>
+    <div class="d-flex align-items-center gap-2 flex-wrap">
+      <div class="form-check mb-0">
+        <input type="checkbox" class="form-check-input" id="picking-priority-only" data-picking-priority-only="picking">
+        <label class="form-check-label" for="picking-priority-only">Приоритетные товары</label>
+      </div>
+      <input type="text" class="form-control form-control-sm" style="max-width:260px" placeholder="Поиск по артикулу/штрихкоду..." data-picking-search="picking">
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover" id="picking-picking" style="font-size:12px">
+      <thead>
+        <tr>
+          <th rowspan="2" class="align-bottom">Артикул</th>
+          <th rowspan="2" class="align-bottom">Размер</th>
+          <th rowspan="2" class="align-bottom">Штрихкод</th>
+          <th rowspan="2" class="align-bottom"></th>
+          <th rowspan="2" class="align-bottom text-end" title="Сумма плана по всем городам ОЗОН и ВБ вместе">Общий план</th>
+          <th rowspan="2" class="align-bottom text-end" title="Общий план минус в пути, готово к отгрузке и на разбраковке — не меньше нуля">Не хватает по плану</th>
+          <th rowspan="2" class="align-bottom text-end" title="Принято на складе-отправителе, но еще не упаковано в короб">На разбраковке</th>
+          {% if sender_warehouses %}
+          <th colspan="{{ sender_warehouses|length }}" class="text-center table-secondary" title="Упаковано в короб на складе-отправителе — готово к отправке; в скобках число коробов">Готово к отгрузке</th>
+          {% else %}
+          <th rowspan="2" class="align-bottom text-end">Готово к отгрузке</th>
+          {% endif %}
+          <th rowspan="2" class="align-bottom text-end" title="Уже отправлено перемещением по всем городам вместе, но еще не подтверждено кнопкой «Принято на складе»">В пути</th>
+          {% if ozon_cities %}<th colspan="{{ ozon_cities|length }}" class="text-center table-info">ОЗОН</th>{% endif %}
+          {% if wb_cities %}<th colspan="{{ wb_cities|length }}" class="text-center table-warning border-start border-2 border-dark">ВБ</th>{% endif %}
+        </tr>
+        <tr>
+          {% for wh in sender_warehouses %}<th class="text-end table-secondary">{{ wh.name }}</th>{% endfor %}
+          {% for city in ozon_cities %}<th class="text-end table-info">{{ city }}</th>{% endfor %}
+          {% for city in wb_cities %}<th class="text-end table-warning{% if loop.first %} border-start border-2 border-dark{% endif %}">{{ city }}</th>{% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="fw-bold table-secondary picking-totals-row">
+          <td colspan="4">Итого ({{ picking_list|length }} поз.)</td>
+          <td class="text-end">{{ picking_totals.total_planned | round(0) | int }}</td>
+          <td class="text-end">{{ picking_totals.total_remaining | round(0) | int }}</td>
+          <td class="text-end">{{ picking_totals.unplaced | round(0) | int }}</td>
+          {% if sender_warehouses %}
+            {% for entry in picking_totals.ready_to_ship_by_warehouse %}
+            <td class="text-end">{{ entry.qty | round(0) | int }} <span class="text-muted small">({{ entry.boxes | int }})</span></td>
+            {% endfor %}
+          {% else %}
+          <td class="text-end">{{ picking_totals.ready_to_ship | round(0) | int }}</td>
+          {% endif %}
+          <td class="text-end">{{ picking_totals.in_transit | round(0) | int }}</td>
+          {% for city in ozon_cities %}<td class="text-end">{{ picking_totals.ozon[city] | round(0) | int }}</td>{% endfor %}
+          {% for city in wb_cities %}<td class="text-end{% if loop.first %} border-start border-2{% endif %}">{{ picking_totals.wb[city] | round(0) | int }}</td>{% endfor %}
+        </tr>
+      {% for cat in picking_groups %}
+        {# Строка-заголовок категории (Вид товара номенклатуры — Кардиганы/
+           Шапки/..., см. чат и файл-образец) — верхний уровень, сворачивает
+           все модели/цвета/размеры внутри разом. #}
+        <tr class="table-secondary fw-bold picking-group-row" data-group-level="category" data-group-category="{{ cat.category }}">
+          <td colspan="3">
+            <span class="picking-toggle" data-toggle-group>▾</span>
+            {{ cat.category }}
+            <span class="text-muted small fw-normal">({{ cat.count }} поз.)</span>
+          </td>
+          <td class="text-nowrap">{% if cat.totals.no_stock_count %}<span class="badge bg-danger" title="Позиций без остатка на складе-отправителе">{{ cat.totals.no_stock_count }}</span>{% endif %}</td>
+          <td class="text-end">{{ cat.totals.total_planned | round(0) | int }}</td>
+          <td class="text-end">{% if cat.totals.total_remaining %}<b>{{ cat.totals.total_remaining | round(0) | int }}</b>{% else %}<span class="text-muted">0</span>{% endif %}</td>
+          <td class="text-end">{% if cat.totals.unplaced %}{{ cat.totals.unplaced | round(0) | int }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          {% if sender_warehouses %}
+            {% for entry in cat.totals.ready_to_ship_by_warehouse %}
+            <td class="text-end">{% if entry.qty %}<b>{{ entry.qty | round(0) | int }}</b> <span class="text-muted small">({{ entry.boxes | int }})</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+            {% endfor %}
+          {% else %}
+          <td class="text-end text-muted">—</td>
+          {% endif %}
+          <td class="text-end">{% if cat.totals.in_transit_total %}<span class="text-warning-emphasis">{{ cat.totals.in_transit_total | round(0) | int }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          {% for city in ozon_cities %}
+            {% set c = cat.totals.ozon[city] %}
+            <td class="text-end">
+              {% if c.remaining %}<b>{{ c.remaining | round(0) | int }}</b>{% else %}<span class="text-muted">0</span>{% endif %}
+              {% if c.in_transit %}<span class="text-warning-emphasis">&nbsp;({{ c.in_transit | round(0) | int }})</span>{% endif %}
+            </td>
+          {% endfor %}
+          {% for city in wb_cities %}
+            {% set c = cat.totals.wb[city] %}
+            <td class="text-end{% if loop.first %} border-start border-2{% endif %}">
+              {% if c.remaining %}<b>{{ c.remaining | round(0) | int }}</b>{% else %}<span class="text-muted">0</span>{% endif %}
+              {% if c.in_transit %}<span class="text-warning-emphasis">&nbsp;({{ c.in_transit | round(0) | int }})</span>{% endif %}
+            </td>
+          {% endfor %}
+        </tr>
+        {% for g in cat.models %}
+        {# Строка-заголовок группы по модели (артикул без цвета, см. чат) —
+           сворачивает/разворачивает все цвета и размеры внутри. Суммы в
+           числовых колонках посчитаны по всем позициям группы, чтобы
+           сворачивание не прятало итоговые цифры. #}
+        <tr class="table-light fw-bold picking-group-row" data-group-level="model" data-group-category="{{ cat.category }}" data-group-model="{{ g.model }}">
+          <td colspan="3" style="padding-left:1.25rem">
+            <span class="picking-toggle" data-toggle-group>▾</span>
+            {{ g.model or '(без модели)' }}
+            <span class="text-muted small fw-normal">({{ g.count }} поз.)</span>
+          </td>
+          <td class="text-nowrap">{% if g.totals.no_stock_count %}<span class="badge bg-danger" title="Позиций без остатка на складе-отправителе">{{ g.totals.no_stock_count }}</span>{% endif %}</td>
+          <td class="text-end">{{ g.totals.total_planned | round(0) | int }}</td>
+          <td class="text-end">{% if g.totals.total_remaining %}<b>{{ g.totals.total_remaining | round(0) | int }}</b>{% else %}<span class="text-muted">0</span>{% endif %}</td>
+          <td class="text-end">{% if g.totals.unplaced %}{{ g.totals.unplaced | round(0) | int }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          {% if sender_warehouses %}
+            {% for entry in g.totals.ready_to_ship_by_warehouse %}
+            <td class="text-end">{% if entry.qty %}<b>{{ entry.qty | round(0) | int }}</b> <span class="text-muted small">({{ entry.boxes | int }})</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+            {% endfor %}
+          {% else %}
+          <td class="text-end text-muted">—</td>
+          {% endif %}
+          <td class="text-end">{% if g.totals.in_transit_total %}<span class="text-warning-emphasis">{{ g.totals.in_transit_total | round(0) | int }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          {% for city in ozon_cities %}
+            {% set c = g.totals.ozon[city] %}
+            <td class="text-end">
+              {% if c.remaining %}<b>{{ c.remaining | round(0) | int }}</b>{% else %}<span class="text-muted">0</span>{% endif %}
+              {% if c.in_transit %}<span class="text-warning-emphasis">&nbsp;({{ c.in_transit | round(0) | int }})</span>{% endif %}
+            </td>
+          {% endfor %}
+          {% for city in wb_cities %}
+            {% set c = g.totals.wb[city] %}
+            <td class="text-end{% if loop.first %} border-start border-2{% endif %}">
+              {% if c.remaining %}<b>{{ c.remaining | round(0) | int }}</b>{% else %}<span class="text-muted">0</span>{% endif %}
+              {% if c.in_transit %}<span class="text-warning-emphasis">&nbsp;({{ c.in_transit | round(0) | int }})</span>{% endif %}
+            </td>
+          {% endfor %}
+        </tr>
+        {% for cg in g.colors %}
+        {# Подгруппа по цвету внутри модели — тот же принцип, сворачивает
+           размеры (отдельные строки товара) под собой. #}
+        <tr class="table-light picking-group-row" data-group-level="color" data-group-category="{{ cat.category }}" data-group-model="{{ g.model }}" data-group-color="{{ cg.color }}">
+          <td colspan="3" style="padding-left:2.5rem">
+            <span class="picking-toggle" data-toggle-group>▾</span>
+            Цвет: {{ cg.color or '—' }}
+            <span class="text-muted small">({{ cg.products|length }} размер.)</span>
+          </td>
+          <td></td>
+          <td class="text-end">{{ cg.totals.total_planned | round(0) | int }}</td>
+          <td class="text-end">{% if cg.totals.total_remaining %}<b>{{ cg.totals.total_remaining | round(0) | int }}</b>{% else %}<span class="text-muted">0</span>{% endif %}</td>
+          <td class="text-end">{% if cg.totals.unplaced %}{{ cg.totals.unplaced | round(0) | int }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          {% if sender_warehouses %}
+            {% for entry in cg.totals.ready_to_ship_by_warehouse %}
+            <td class="text-end">{% if entry.qty %}<b>{{ entry.qty | round(0) | int }}</b> <span class="text-muted small">({{ entry.boxes | int }})</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+            {% endfor %}
+          {% else %}
+          <td class="text-end text-muted">—</td>
+          {% endif %}
+          <td class="text-end">{% if cg.totals.in_transit_total %}<span class="text-warning-emphasis">{{ cg.totals.in_transit_total | round(0) | int }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          {% for city in ozon_cities %}
+            {% set c = cg.totals.ozon[city] %}
+            <td class="text-end">
+              {% if c.remaining %}<b>{{ c.remaining | round(0) | int }}</b>{% else %}<span class="text-muted">0</span>{% endif %}
+              {% if c.in_transit %}<span class="text-warning-emphasis">&nbsp;({{ c.in_transit | round(0) | int }})</span>{% endif %}
+            </td>
+          {% endfor %}
+          {% for city in wb_cities %}
+            {% set c = cg.totals.wb[city] %}
+            <td class="text-end{% if loop.first %} border-start border-2{% endif %}">
+              {% if c.remaining %}<b>{{ c.remaining | round(0) | int }}</b>{% else %}<span class="text-muted">0</span>{% endif %}
+              {% if c.in_transit %}<span class="text-warning-emphasis">&nbsp;({{ c.in_transit | round(0) | int }})</span>{% endif %}
+            </td>
+          {% endfor %}
+        </tr>
+        {% for p in cg.products %}
+        {# Приоритет из файла плана (см. чат) красит строку, когда есть
+           запас — no_stock важнее (нечем отгружать вообще) и имеет
+           приоритет над цветом приоритета. Товар-новинка (0w/0o, см.
+           novelty_marketplace) красится отдельным цветом и получает
+           бейджик — у него нет собственного плана, поэтому его нужно
+           отличать от обычных приоритетных строк. Колонки "Приоритет" в
+           таблице нет — только фон строки. #}
+        <tr class="picking-item-row {% if p.no_stock %}table-danger{% elif p.novelty_marketplace %}table-primary{% elif p.priority == 1 %}table-success{% elif p.priority == 2 %}table-warning{% elif p.priority == 0 %}table-info{% endif %}" data-search-text="{{ (p.article or '') ~ ' ' ~ p.barcode }}" data-priority="{{ p.novelty_marketplace or (p.priority if p.priority is not none else '') }}" data-group-category="{{ cat.category }}" data-group-model="{{ g.model }}" data-group-color="{{ cg.color }}">
+          <td>{{ p.model }}{% if p.novelty_marketplace %} <span class="badge bg-primary">Новинка {{ 'ВБ' if p.novelty_marketplace == 'wb' else 'Ozon' }}</span>{% endif %}</td>
+          <td>{{ p.size or '' }}</td>
+          <td>{{ p.barcode }}</td>
+          <td class="text-nowrap">{% if p.no_stock %}<span class="badge bg-danger" title="Нет на складе-отправителе">нет на складе</span>{% endif %}</td>
+          <td class="text-end">{{ p.total_planned | round(0) | int }}</td>
+          <td class="text-end">{% if p.total_remaining %}<b>{{ p.total_remaining | round(0) | int }}</b>{% else %}<span class="text-muted">0</span>{% endif %}</td>
+          <td class="text-end">{% if p.unplaced %}{{ p.unplaced | round(0) | int }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          {% if sender_warehouses %}
+            {% for entry in p.ready_to_ship_by_warehouse %}
+            <td class="text-end">{% if entry.qty %}<b>{{ entry.qty | round(0) | int }}</b> <span class="text-muted small">({{ entry.boxes | int }})</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+            {% endfor %}
+          {% else %}
+          <td class="text-end">{% if p.ready_to_ship %}<b>{{ p.ready_to_ship | round(0) | int }}</b>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          {% endif %}
+          <td class="text-end">{% if p.in_transit_total %}<span class="text-warning-emphasis">{{ p.in_transit_total | round(0) | int }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          {% for city in ozon_cities %}
+            {% set line = p.ozon.get(city) %}
+            <td class="text-end">
+              {% if not line %}<span class="text-muted">—</span>
+              {% elif line.remaining_qty() <= 0 %}<span class="text-muted">0</span>
+              {% else %}<b>{{ line.remaining_qty() | round(0) | int }}</b>{% endif %}
+              {% if line and line.in_transit_qty %}<span class="text-warning-emphasis" title="Товар в пути уже вычитается из подсказки «Куда везти короб»">&nbsp;({{ line.in_transit_qty | round(0) | int }})</span>{% endif %}
+            </td>
+          {% endfor %}
+          {% for city in wb_cities %}
+            {% set line = p.wb.get(city) %}
+            <td class="text-end{% if loop.first %} border-start border-2{% endif %}">
+              {% if not line %}<span class="text-muted">—</span>
+              {% elif line.remaining_qty() <= 0 %}<span class="text-muted">0</span>
+              {% else %}<b>{{ line.remaining_qty() | round(0) | int }}</b>{% endif %}
+              {% if line and line.in_transit_qty %}<span class="text-warning-emphasis" title="Товар в пути уже вычитается из подсказки «Куда везти короб»">&nbsp;({{ line.in_transit_qty | round(0) | int }})</span>{% endif %}
+            </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+        {% endfor %}
+        {% endfor %}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% elif marketplaces|selectattr('plan')|list %}
+<div class="card p-3 mb-4">
+  <p class="text-muted mb-0">Весь план выполнен — отправлять больше нечего.</p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Поиск по тексту и галочка "Приоритетные товары" работают на одних и
+  // тех же строках вместе — строка скрывается, если не проходит хотя бы
+  // один из двух активных фильтров (см. чат). Строки товара сгруппированы
+  // под заголовками модель/цвет (см. picking_groups в shipment_plan.py) —
+  // заголовок виден, только если под ним есть хоть одно совпадение;
+  // сворачивание/разворот группы (кнопка ▾) игнорируется, пока активен
+  // поиск или галочка "Приоритетные", чтобы найденное не пряталось в
+  // свернутой группе.
+  document.querySelectorAll("[data-picking-search], [data-picking-priority-only], [data-picking-collapse-all]").forEach(function (control) {
+    var key = control.dataset.pickingSearch || control.dataset.pickingPriorityOnly || control.dataset.pickingCollapseAll;
+    var table = document.getElementById("picking-" + key);
+    if (!table) return;
+    var scope = table.closest(".card");
+    var searchInput = scope.querySelector("[data-picking-search='" + key + "']");
+    var priorityCheckbox = scope.querySelector("[data-picking-priority-only='" + key + "']");
+    var collapseAllCheckbox = scope.querySelector("[data-picking-collapse-all='" + key + "']");
+
+    // Общий переключатель "Свернуть все группы" (см. чат) — форсирует
+    // состояние ▾/▸ сразу на всех заголовках модель/цвет, а не только на
+    // том, по которому кликнули (см. click-обработчик ниже).
+    function setAllGroupsCollapsed(collapsed) {
+      table.querySelectorAll(".picking-group-row").forEach(function (row) {
+        row.classList.toggle("picking-group-collapsed", collapsed);
+        var toggle = row.querySelector("[data-toggle-group]");
+        if (toggle) toggle.textContent = collapsed ? "▸" : "▾";
+      });
+    }
+
+    function applyFilters() {
+      var q = (searchInput && searchInput.value.trim().toLowerCase()) || "";
+      var priorityOnly = priorityCheckbox && priorityCheckbox.checked;
+      var filterActive = q.length > 0 || priorityOnly;
+
+      var rows = Array.prototype.slice.call(table.querySelectorAll("tbody tr:not(.picking-totals-row)"));
+      // Строки идут в DOM в порядке категория → модель → её цвета → их
+      // размеры, поэтому "последний встреченный" заголовок каждого уровня
+      // — это и есть родитель текущей строки-товара, без сопоставления по
+      // атрибутам.
+      var currentCategoryRow = null;
+      var currentModelRow = null;
+      var currentColorRow = null;
+      var categoryCollapsed = false;
+      var modelCollapsed = false;
+      var colorCollapsed = false;
+
+      rows.forEach(function (tr) {
+        if (tr.classList.contains("picking-group-row")) {
+          if (tr.dataset.groupLevel === "category") {
+            currentCategoryRow = tr;
+            categoryCollapsed = tr.classList.contains("picking-group-collapsed");
+            currentModelRow = null;
+            modelCollapsed = false;
+            currentColorRow = null;
+            colorCollapsed = false;
+            delete tr.dataset.hasMatch;
+          } else if (tr.dataset.groupLevel === "model") {
+            currentModelRow = tr;
+            modelCollapsed = tr.classList.contains("picking-group-collapsed");
+            currentColorRow = null;
+            colorCollapsed = false;
+            // Свернутая категория прячет и заголовки своих моделей, не
+            // только строки-товаров под ними (тот же принцип, что и у
+            // модель→цвет, см. чат) — запоминаем это здесь, пока известен
+            // currentCategoryRow, второй проход ниже уже не видит
+            // родителя строки.
+            tr.dataset.parentCollapsed = (!filterActive && categoryCollapsed) ? "1" : "";
+            delete tr.dataset.hasMatch;
+          } else {
+            currentColorRow = tr;
+            colorCollapsed = tr.classList.contains("picking-group-collapsed");
+            tr.dataset.parentCollapsed = (!filterActive && (categoryCollapsed || modelCollapsed)) ? "1" : "";
+            delete tr.dataset.hasMatch;
+          }
+          return;
+        }
+        var text = (tr.dataset.searchText || "").toLowerCase();
+        var matchesSearch = q.length === 0 || text.indexOf(q) !== -1;
+        var matchesPriority = !priorityOnly || (tr.dataset.priority || "") !== "";
+        var matchesFilter = matchesSearch && matchesPriority;
+        if (matchesFilter) {
+          if (currentCategoryRow) currentCategoryRow.dataset.hasMatch = "1";
+          if (currentModelRow) currentModelRow.dataset.hasMatch = "1";
+          if (currentColorRow) currentColorRow.dataset.hasMatch = "1";
+        }
+        var collapsedByGroup = !filterActive && (categoryCollapsed || modelCollapsed || colorCollapsed);
+        tr.hidden = !matchesFilter || collapsedByGroup;
+      });
+
+      rows.forEach(function (tr) {
+        if (!tr.classList.contains("picking-group-row")) return;
+        var hasMatch = tr.dataset.hasMatch === "1";
+        delete tr.dataset.hasMatch;
+        if (tr.dataset.groupLevel === "category") {
+          tr.hidden = !hasMatch;
+        } else {
+          var parentCollapsed = tr.dataset.parentCollapsed === "1";
+          delete tr.dataset.parentCollapsed;
+          tr.hidden = !hasMatch || parentCollapsed;
+        }
+      });
+    }
+
+    control.addEventListener(control.type === "checkbox" ? "change" : "input", applyFilters);
+
+    if (control === collapseAllCheckbox) {
+      collapseAllCheckbox.addEventListener("change", function () {
+        setAllGroupsCollapsed(collapseAllCheckbox.checked);
+        applyFilters();
+      });
+    }
+
+    // Клик по ▾/▸ у заголовка группы сворачивает/разворачивает её —
+    // применяется через тот же applyFilters, чтобы учесть текущий фильтр.
+    // На таблицу вешаем только один раз (data-row-toggle-bound) — иначе
+    // при нескольких контролах (поиск + галочка "Приоритетные", у обоих
+    // тот же key "picking") этот forEach выполнился бы дважды и повесил
+    // бы ДВА обработчика клика на одну и ту же таблицу: оба сработали бы
+    // на один клик и взаимно отменили друг друга через classList.toggle,
+    // из-за чего сворачивание визуально не срабатывало.
+    if (!table.dataset.rowToggleBound) {
+      table.dataset.rowToggleBound = "1";
+      table.addEventListener("click", function (e) {
+        var toggle = e.target.closest("[data-toggle-group]");
+        if (!toggle) return;
+        var row = toggle.closest("tr");
+        row.classList.toggle("picking-group-collapsed");
+        toggle.textContent = row.classList.contains("picking-group-collapsed") ? "▸" : "▾";
+        applyFilters();
+      });
+
+      // При открытии страницы таблица сразу в свернутом виде (см. чат) —
+      // галочка "Свернуть все группы" по умолчанию отмечена (checked в
+      // разметке), здесь применяем это состояние к самим строкам сразу
+      // при загрузке, а не только по клику на галочку.
+      if (collapseAllCheckbox && collapseAllCheckbox.checked) {
+        setAllGroupsCollapsed(true);
+      }
+      applyFilters();
+    }
+  });
+
+  // «% вып.» как группа: кнопка ▸/▾ в шапке показывает/скрывает колонки по
+  // складам-отправителям (см. чат). Состояние — класс senders-collapsed на
+  // таблице, запоминается отдельно для ОЗОН и ВБ; localStorage может быть
+  // недоступен (приватный режим) — тогда просто работает без запоминания.
+  document.querySelectorAll(".city-table").forEach(function (table) {
+    var key = "wmsCitySenders:" + table.dataset.sendersKey;
+    var toggle = table.querySelector(".senders-toggle");
+    if (!toggle) return;
+    function apply(expanded) {
+      table.classList.toggle("senders-collapsed", !expanded);
+      toggle.textContent = expanded ? "▾" : "▸";
+    }
+    var expanded = false;
+    try { expanded = localStorage.getItem(key) === "1"; } catch (e) {}
+    apply(expanded);
+    toggle.addEventListener("click", function () {
+      expanded = table.classList.contains("senders-collapsed");
+      apply(expanded);
+      try { localStorage.setItem(key, expanded ? "1" : "0"); } catch (e) {}
+    });
+  });
+
+  // «Дата плана» — смена даты сохраняет её на сервере и сразу получает
+  // обновленные (пересчитанные и пересортированные по дате) строки
+  // городов этой карточки, без перезагрузки страницы (см. чат: "без
+  // перезагрузки страницы"). Делегирование на document — строки города
+  // каждый раз перерисовываются целиком, обычный addEventListener на
+  // конкретном input пропал бы вместе со старой версией строки.
+  document.addEventListener("change", function (e) {
+    var input = e.target.closest(".city-deadline-input");
+    if (!input) return;
+    var form = input.closest("form");
+    var tbody = input.closest(".city-rows-body");
+    if (!form || !tbody) return;
+
+    var formData = new FormData();
+    formData.append("ship_by_date", input.value);
+    fetch(form.action, {
+      method: "POST",
+      headers: {"X-Requested-With": "XMLHttpRequest"},
+      body: formData,
+    })
+      .then(function (resp) { return resp.ok ? resp.text() : Promise.reject(resp); })
+      .then(function (html) { tbody.innerHTML = html; })
+      .catch(function () {
+        // Сеть недоступна/ошибка сервера — проще перезагрузить страницу
+        // обычным способом, чем оставить дату несохраненной молча.
+        form.submit();
+      });
+  });
+</script>
+{% endblock %}

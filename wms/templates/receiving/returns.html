@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Возвраты поставщику{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4">
+  <h3 class="mb-0">Возвраты поставщику</h3>
+  <a class="btn btn-outline-secondary" href="{{ url_for('receiving.list_documents') }}">&larr; Приемка</a>
+</div>
+
+<div class="card p-3">
+  <p class="text-muted small mb-3">
+    Возврат создается из количества брака, указанного на этапе
+    «Разбраковка» в документе приемки.
+  </p>
+  <table class="table table-sm d-none d-md-table">
+    <thead>
+      <tr>
+        <th>Дата</th>
+        <th>Приемка</th>
+        <th>№ заказа</th>
+        <th>Поставщик</th>
+        <th>Товар</th>
+        <th>Кол-во</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for r in returns %}
+      <tr>
+        <td class="text-nowrap">{{ (r.created_at|msk).strftime('%d.%m.%Y %H:%M') }}</td>
+        <td>
+          {% if r.receiving_document %}
+            <a href="{{ url_for('receiving.detail', doc_id=r.receiving_document.id) }}">{{ r.receiving_document.number }}</a>
+          {% else %}
+            <span class="text-muted">без приемки</span>
+          {% endif %}
+        </td>
+        <td>{{ r.order_number or (r.receiving_document.order_number if r.receiving_document else '') }}</td>
+        <td>{{ r.supplier_name or '' }}</td>
+        <td>{{ r.nomenclature.name }} <span class="text-muted">({{ r.nomenclature.sku }})</span></td>
+        <td>{{ r.qty }} {{ r.nomenclature.unit }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="text-muted">Возвратов еще нет</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="list-group d-md-none">
+    {% for r in returns %}
+      <div class="list-group-item py-2 px-2">
+        <div class="d-flex justify-content-between align-items-start gap-2">
+          <div>
+            <div>{{ r.nomenclature.name }} <span class="text-muted small">({{ r.nomenclature.sku }})</span></div>
+            <div class="small text-muted">
+              {{ r.qty }} {{ r.nomenclature.unit }} · {{ r.supplier_name or '' }}
+              {% if r.receiving_document %} · <a href="{{ url_for('receiving.detail', doc_id=r.receiving_document.id) }}">{{ r.receiving_document.number }}</a>{% endif %}
+            </div>
+            <div class="small text-muted">{{ (r.created_at|msk).strftime('%d.%m.%Y %H:%M') }}</div>
+          </div>
+        </div>
+      </div>
+    {% else %}
+      <div class="list-group-item text-muted">Возвратов еще нет</div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

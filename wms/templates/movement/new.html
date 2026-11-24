@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Новое перемещение{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('movement.list_documents') }}">&larr; Перемещение</a></p>
+<h3 class="mb-4">Новый список перемещения</h3>
+
+{% if warehouses|length < 2 %}
+  <div class="alert alert-warning">Для перемещения нужно как минимум два склада: <a href="{{ url_for('warehouses.list_warehouses') }}">Склады</a></div>
+{% else %}
+<div class="col-md-5">
+  <div class="card p-3">
+    <p class="text-muted small">Все короба, которые вы отсканируете в этом списке, едут с одного склада-отправителя на один склад назначения.</p>
+    <form method="post">
+      <div class="mb-3">
+        <label class="form-label">Склад-отправитель</label>
+        {% if current_user.is_admin %}
+        <select name="from_warehouse_id" class="form-select" required>
+          <option value="">Выберите склад...</option>
+          {% for wh in warehouses %}
+            <option value="{{ wh.id }}" {% if assigned_warehouse and assigned_warehouse.id == wh.id %}selected{% endif %}>{{ wh.code }} — {{ wh.name }}</option>
+          {% endfor %}
+        </select>
+        {% elif assigned_warehouse %}
+        <input type="hidden" name="from_warehouse_id" value="{{ assigned_warehouse.id }}">
+        <div class="form-control bg-light">{{ assigned_warehouse.code }} — {{ assigned_warehouse.name }}</div>
+        <div class="form-text">Определен по вашему рабочему складу.</div>
+        {% else %}
+        <div class="alert alert-warning mb-0">Рабочий склад не назначен. Обратитесь к администратору.</div>
+        {% endif %}
+      </div>
+      <div class="mb-3">
+        <label class="form-label">Склад назначения</label>
+        <select name="to_warehouse_id" class="form-select" required>
+          <option value="">Выберите склад...</option>
+          {% for wh in warehouses %}
+            <option value="{{ wh.id }}">{{ wh.code }} — {{ wh.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <button type="submit" class="btn btn-primary">Создать список и сканировать короба</button>
+    </form>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

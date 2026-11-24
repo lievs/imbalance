@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Обмен с 1С{% endblock %}
+{% block content %}
+<h3 class="mb-4">Обмен с 1С</h3>
+
+<div class="row g-4">
+  <div class="col-md-6">
+    <div class="card p-3">
+      <h5>Токен доступа</h5>
+      <p class="text-muted small">
+        Внешняя обработка в 1С обращается к WMS по этому токену (не по
+        логину/паролю пользователя). Токен нужно один раз указать в
+        обработке при настройке.
+      </p>
+      {% if token %}
+        <div class="alert alert-secondary" style="word-break:break-all;"><code>{{ token }}</code></div>
+      {% else %}
+        <p class="text-danger">Токен еще не сгенерирован — обмен работать не будет.</p>
+      {% endif %}
+      <form method="post" onsubmit="return confirm('Сгенерировать новый токен? Старый сразу перестанет работать — обработку в 1С придется перенастроить.');">
+        <button type="submit" class="btn btn-outline-danger">🔑 {{ 'Перевыпустить токен' if token else 'Сгенерировать токен' }}</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="col-md-6">
+    <div class="card p-3">
+      <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <h5 class="mb-0">Что ждет выгрузки</h5>
+        <a class="btn btn-sm btn-outline-primary" href="{{ url_for('integration_1c.pending') }}">📋 Открыть списки документов</a>
+      </div>
+      <p class="mt-2">Перемещений (создана заявка на МП): <b>{{ pending_movements }}</b></p>
+      <p>Инвентаризаций (завершенных): <b>{{ pending_inventories }}</b></p>
+      <p>Возвратов поставщику (из разбраковки приемок): <b>{{ pending_supplier_returns }}</b>
+        — <a href="{{ url_for('receiving.returns_list') }}">список со статусом выгрузки</a></p>
+      <p>Корректировок количества в приходных накладных (расхождение по пересчету): <b>{{ pending_receiving_adjustments }}</b></p>
+      <p>Перемещений с изменившимся составом (уже выгружены, но короба/кол-во поправили после): <b>{{ pending_movement_corrections }}</b></p>
+      <p class="text-muted small mb-0">
+        Обновляется сразу после того, как 1С подтвердит прием документов
+        (кнопка «Синхронизировать» в обработке) — повторно эти же
+        документы не выгружаются. В «Списках документов» можно убрать
+        конкретный документ из очереди вручную, если он уже внесен в 1С
+        отдельно.
+      </p>
+      <p class="text-muted small mb-0 mt-2">
+        Возврат поставщику 1С привязывает к «Заказу поставщику» по полю
+        «№ заявки» приемки — надежнее всего вносить туда полный номер из
+        реквизита «Номер» (например «ШМ-005»). Короткое число из заголовка
+        формы («Заказ поставщику 5 от …» → 5) тоже сработает, но только
+        если у приемки указан поставщик и он совпадает с поставщиком
+        найденного заказа — короткие номера у разных площадок/поставщиков
+        нередко совпадают (например «ШМ-005» и «ОЗ-К05» — у обоих «5»).
+        Если накладная закрывает сразу несколько заявок — вписывайте оба
+        номера через «/» или «,» (например «ВБ-К11/ВБ-К10»): возврат
+        всегда привяжется к ПЕРВОМУ из них, даже если по факту возвращаемая
+        позиция относится ко второй заявке — на точное разделение по
+        заявкам сейчас это не рассчитано.
+      </p>
+      <p class="text-muted small mb-0 mt-2">
+        Коррекцию состава перемещения 1С ищет по номеру WMS, зашитому в поле
+        «Комментарий» документа (проставляется автоматически при первой
+        выгрузке) — отдельного реквизита-номера у перемещения в 1С нет.
+        Если документ уже проведен, 1С корректировку не выполнит — как и с
+        накладными, поправить проведенный документ нужно вручную.
+      </p>
+    </div>
+
+    <div class="card p-3 mt-3">
+      <h5>Адрес для обработки в 1С</h5>
+      <p class="text-muted small mb-1">Получить документы (GET, токен — заголовком <code>X-1C-Token</code> или параметром <code>?token=</code>):</p>
+      <code class="d-block mb-2">{{ request.url_root }}integrations/1c/api/export</code>
+      <p class="text-muted small mb-1">Получить существующие перемещения и приёмки для повторной сверки за период (без параметров — последние 30 дней):</p>
+      <code class="d-block mb-2">{{ request.url_root }}integrations/1c/api/reconciliation?date_from=2026-09-01&amp;date_to=2026-09-21</code>
+      <p class="text-muted small mb-1">Подтвердить прием (POST, JSON <code>{"movement_ids": [...], "inventory_ids": [...], "supplier_return_ids": [...], "movement_correction_ids": [...]}</code>):</p>
+      <code class="d-block">{{ request.url_root }}integrations/1c/api/export/confirm</code>
+    </div>
+  </div>
+</div>
+{% endblock %}

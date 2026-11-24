@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+{% block title %}Настройки{% endblock %}
+{% block content %}
+<h3 class="mb-4">Настройки</h3>
+
+<h5 class="mb-3">Пользователи</h5>
+<div class="row g-4 mb-5">
+  <div class="col-md-4">
+    <div class="card p-3">
+      <h5>Добавить пользователя</h5>
+      <form method="post" action="{{ url_for('auth.create_user') }}">
+        <div class="mb-2">
+          <label class="form-label">Логин</label>
+          <input type="text" name="username" class="form-control" required>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Имя (необязательно)</label>
+          <input type="text" name="full_name" class="form-control">
+        </div>
+        <div class="form-check mb-2">
+          <input type="checkbox" name="is_admin" class="form-check-input" id="isAdminCheck">
+          <label class="form-check-label" for="isAdminCheck">Администратор</label>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Роль</label>
+          <select name="role" class="form-select">
+            <option value="warehouse">Сотрудник склада (полный доступ)</option>
+            <option value="logist">Логист (только перемещения, ожидающие транспорт)</option>
+            <option value="fulfillment">Фулфилмент (только приемка и перемещения своего склада)</option>
+          </select>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Рабочий склад</label>
+          <select name="warehouse_id" class="form-select">
+            <option value="">Не назначен</option>
+            {% for wh in warehouses %}{% if wh.is_active %}<option value="{{ wh.id }}">{{ wh.name }}</option>{% endif %}{% endfor %}
+          </select>
+        </div>
+        <button type="submit" class="btn btn-primary">Создать</button>
+      </form>
+      <p class="text-muted small mt-2 mb-0">Временный пароль сгенерируется автоматически и покажется один раз после создания.</p>
+    </div>
+  </div>
+
+  <div class="col-md-8">
+    <div class="card p-3">
+      <table class="table table-sm table-mobile-compact">
+        <thead><tr><th>Логин</th><th>Имя</th><th>Права</th><th>Разделы</th><th>Рабочий склад</th><th>Роль</th><th>Статус</th><th></th></tr></thead>
+        <tbody>
+        {% for u in users %}
+          <tr>
+            <td style="min-width:140px">
+              <form method="post" action="{{ url_for('auth.update_username', user_id=u.id) }}" class="d-flex gap-1">
+                <input type="text" name="username" value="{{ u.username }}" class="form-control form-control-sm" required>
+                <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+              </form>
+            </td>
+            <td>{{ u.full_name or '' }}</td>
+            <td>
+              {% if u.id == current_user.id %}
+                <span class="badge bg-primary">Админ (вы)</span>
+              {% else %}
+                <form method="post" action="{{ url_for('auth.toggle_admin', user_id=u.id) }}" class="d-inline"
+                      onsubmit="return confirm('{{ ('Снять права администратора у «' ~ u.username ~ '»?') if u.is_admin else ('Выдать «' ~ u.username ~ '» полные права администратора?') }}');">
+                  <button type="submit" class="btn btn-sm {{ 'btn-primary' if u.is_admin else 'btn-outline-secondary' }}">
+                    {{ 'Админ' if u.is_admin else 'Сотрудник' }}
+                  </button>
+                </form>
+              {% endif %}
+            </td>
+            <td>
+              {% if u.is_admin %}
+                <span class="text-muted small">Полный (админ)</span>
+              {% else %}
+                <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#sectionsModal{{ u.id }}">
+                  {% if not u.allowed_sections %}Полный доступ
+                  {% elif u.allowed_sections == 'none' %}Доступа нет
+                  {% else %}Настроено ({{ u.allowed_section_set()|length }}){% endif %}
+                </button>
+                <div class="modal fade" id="sectionsModal{{ u.id }}" tabindex="-1" aria-hidden="true">
+                  <div class="modal-dialog">
+                    <div class="modal-content">
+                      <form method="post" action="{{ url_for('auth.update_sections', user_id=u.id) }}">
+                        <div class="modal-header">
+                          <h5 class="modal-title">Доступ к разделам — {{ u.display_name() }}</h5>
+                          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button>
+                        </div>
+                        <div class="modal-body">
+                          {% set allowed = u.allowed_section_set() %}
+                          <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="mode" value="full" id="modeFull{{ u.id }}"
+                                   {% if not u.allowed_sections %}checked{% endif %}
+                                   onchange="document.getElementById('sectionsList{{ u.id }}').classList.add('d-none')">
+                            <label class="form-check-label" for="modeFull{{ u.id }}">Полный доступ ко всем разделам</label>
+                          </div>
+                          <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="mode" value="restricted" id="modeRestricted{{ u.id }}"
+                                   {% if u.allowed_sections %}checked{% endif %}
+                                   onchange="document.getElementById('sectionsList{{ u.id }}').classList.remove('d-none')">
+                            <label class="form-check-label" for="modeRestricted{{ u.id }}">Только выбранные разделы</label>
+                          </div>
+                          <div id="sectionsList{{ u.id }}" class="{% if not u.allowed_sections %}d-none{% endif %} ps-3 border-start">
+                            {% for code, label in sections %}
+                            <div class="form-check">
+                              <input class="form-check-input" type="checkbox" name="section_{{ code }}" id="sec-{{ u.id }}-{{ code }}" {% if code in allowed %}checked{% endif %}>
+                              <label class="form-check-label" for="sec-{{ u.id }}-{{ code }}">{{ label }}</label>
+                            </div>
+                            {% endfor %}
+                          </div>
+                          <hr>
+                          <div class="form-check">
+                            <input class="form-check-input" type="checkbox" name="nomenclature_edit" id="nomEdit{{ u.id }}" {% if u.nomenclature_edit_allowed %}checked{% endif %}>
+                            <label class="form-check-label" for="nomEdit{{ u.id }}">Разрешить редактирование номенклатуры</label>
+                            <div class="text-muted small">Просмотр номенклатуры и «Где товар» не зависит от этой галочки — только добавление товаров, изменение вида/нормы и импорт из Excel.</div>
+                          </div>
+                          <div class="form-check mt-3">
+                            <input class="form-check-input" type="checkbox" name="invoice_receiving_view" id="invoiceReceivingView{{ u.id }}" {% if u.invoice_receiving_view_allowed %}checked{% endif %}>
+                            <label class="form-check-label" for="invoiceReceivingView{{ u.id }}">Просмотр всех приемок по накладным</label>
+                            <div class="text-muted small">Выдайте это право приемщику и заведующему складом. Ручные приемки других сотрудников останутся скрыты.</div>
+                          </div>
+                          <div class="form-check mt-3">
+                            <input class="form-check-input" type="checkbox" name="movement_view" id="movementView{{ u.id }}" {% if u.movement_view_allowed %}checked{% endif %}>
+                            <label class="form-check-label" for="movementView{{ u.id }}">Просмотр всех перемещений</label>
+                            <div class="text-muted small">Пользователь увидит перемещения других сотрудников, но не сможет изменять или завершать их.</div>
+                          </div>
+                          <div class="form-check mt-3">
+                            <input class="form-check-input" type="checkbox" name="movement_complete" id="movementComplete{{ u.id }}" {% if u.movement_complete_allowed %}checked{% endif %}>
+                            <label class="form-check-label" for="movementComplete{{ u.id }}">Завершение чужих перемещений</label>
+                            <div class="text-muted small">Даёт кнопку завершения сборки чужого перемещения.</div>
+                          </div>
+                          <div class="form-check mt-3">
+                            <input class="form-check-input" type="checkbox" name="movement_receive" id="movementReceive{{ u.id }}" {% if u.movement_receive_allowed %}checked{% endif %}>
+                            <label class="form-check-label" for="movementReceive{{ u.id }}">Кнопка «Принято на складе»</label>
+                            <div class="text-muted small">Разрешает подтвердить фактическое количество и зафиксировать недовоз.</div>
+                          </div>
+                          <div class="form-check mt-3">
+                            <input class="form-check-input" type="checkbox" name="management_dashboard" id="managementDashboard{{ u.id }}" {% if u.management_dashboard_allowed %}checked{% endif %}>
+                            <label class="form-check-label" for="managementDashboard{{ u.id }}">Панель руководителя</label>
+                            <div class="text-muted small">Открывает сводные показатели эффективности, узкие места и проблемные процессы.</div>
+                          </div>
+                        </div>
+                        <div class="modal-footer">
+                          <button type="submit" class="btn btn-primary btn-sm">Сохранить</button>
+                        </div>
+                      </form>
+                    </div>
+                  </div>
+                </div>
+              {% endif %}
+            </td>
+            <td style="min-width:190px">
+              <form method="post" action="{{ url_for('auth.update_warehouse', user_id=u.id) }}" class="d-flex gap-1">
+                <select name="warehouse_id" class="form-select form-select-sm">
+                  <option value="">Не назначен</option>
+                  {% for wh in warehouses %}{% if wh.is_active %}<option value="{{ wh.id }}" {% if u.warehouse_id == wh.id %}selected{% endif %}>{{ wh.name }}</option>{% endif %}{% endfor %}
+                </select>
+                <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+              </form>
+            </td>
+            <td style="min-width:200px">
+              <form method="post" action="{{ url_for('auth.update_role', user_id=u.id) }}" class="d-flex gap-1">
+                <select name="role" class="form-select form-select-sm" {% if u.id == current_user.id and not u.is_admin %}disabled{% endif %}>
+                  <option value="warehouse" {% if u.role == 'warehouse' %}selected{% endif %}>Склад (полный доступ)</option>
+                  <option value="logist" {% if u.role == 'logist' %}selected{% endif %}>Логист (ждут транспорта)</option>
+                  <option value="fulfillment" {% if u.role == 'fulfillment' %}selected{% endif %}>Фулфилмент (приемка+перемещения своего склада)</option>
+                </select>
+                {% if u.id != current_user.id or u.is_admin %}
+                <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+                {% endif %}
+              </form>
+            </td>
+            <td>{% if u.is_active_user %}<span class="badge bg-success">Активен</span>{% else %}<span class="badge bg-secondary">Отключен</span>{% endif %}</td>
+            <td class="text-nowrap">
+              <form method="post" action="{{ url_for('auth.set_password', user_id=u.id) }}" class="d-inline-flex gap-1 align-items-center">
+                <input type="text" name="password" class="form-control form-control-sm" style="width:150px" placeholder="Новый пароль" minlength="4" required>
+                <button type="submit" class="btn btn-sm btn-outline-secondary">Установить</button>
+              </form>
+              <form method="post" action="{{ url_for('auth.revoke_sessions', user_id=u.id) }}" class="d-inline"
+                    onsubmit="return confirm('{{ 'Завершить все сессии на других устройствах?' if u.id == current_user.id else 'Завершить все активные сессии пользователя?' }}');">
+                <button type="submit" class="btn btn-sm btn-outline-warning">
+                  {{ 'Завершить другие сессии' if u.id == current_user.id else 'Завершить сессии' }}
+                </button>
+              </form>
+              {% if u.id != current_user.id %}
+              <form method="post" action="{{ url_for('auth.toggle_user', user_id=u.id) }}" class="d-inline">
+                <button type="submit" class="btn btn-sm btn-outline-secondary">{{ 'Отключить' if u.is_active_user else 'Включить' }}</button>
+              </form>
+              <form method="post" action="{{ url_for('auth.delete_user', user_id=u.id) }}" class="d-inline"
+                    onsubmit="return confirm('Удалить пользователя «{{ u.username }}» насовсем? В его документах поле «Автор» станет пустым, сами документы останутся.');">
+                <button type="submit" class="btn btn-sm btn-outline-danger">Удалить</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+{% set hint_stickers = "Печатаются на стикерах отправления (см. «Перемещение» → печать стикеров по выбранным документам)." %}
+{% set hint_sender = "Если задано — печатается на всех стикерах вместо названия фактического склада-отправителя каждого документа. Пустое поле возвращает поведение по умолчанию (свой склад-отправитель на каждом направлении)." %}
+{% set hint_recipients = "Название/адрес/телефон получателя на складе назначения, в первую очередь для складов-городов маркетплейсов." %}
+<h5 class="mb-3 d-flex align-items-center gap-2">
+  Стикеры перемещений
+  <button type="button" class="hint-icon d-md-none" data-bs-toggle="popover" data-bs-trigger="focus"
+          data-bs-placement="bottom" data-bs-content="{{ hint_stickers }}" aria-label="Подсказка">?</button>
+</h5>
+<p class="text-muted small d-none d-md-block">{{ hint_stickers }}</p>
+
+<div class="card p-3 mb-3">
+  <h6 class="d-flex align-items-center gap-2">
+    Отправитель — сразу на все направления
+    <button type="button" class="hint-icon d-md-none" data-bs-toggle="popover" data-bs-trigger="focus"
+            data-bs-placement="bottom" data-bs-content="{{ hint_sender }}" aria-label="Подсказка">?</button>
+  </h6>
+  <p class="text-muted small mb-2 d-none d-md-block">{{ hint_sender }}</p>
+  <form method="post" action="{{ url_for('movement.update_shipping_label_sender') }}" class="d-flex gap-1" style="max-width:480px">
+    <input type="text" name="sender" value="{{ shipping_label_sender or '' }}" class="form-control form-control-sm" placeholder="Название, адрес, телефон (необязательно)">
+    <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+  </form>
+</div>
+
+<h6 class="d-flex align-items-center gap-2">
+  Получатели по складам
+  <button type="button" class="hint-icon d-md-none" data-bs-toggle="popover" data-bs-trigger="focus"
+          data-bs-placement="bottom" data-bs-content="{{ hint_recipients }}" aria-label="Подсказка">?</button>
+</h6>
+<p class="text-muted small d-none d-md-block">{{ hint_recipients }}</p>
+<div class="card p-3">
+  <table class="table table-sm table-mobile-compact">
+    <thead><tr><th>Код</th><th>Склад</th><th>Получатель</th></tr></thead>
+    <tbody>
+    {% for wh in warehouses %}
+      <tr>
+        <td>{{ wh.code }}</td>
+        <td>{{ wh.name }}</td>
+        <td style="min-width:320px">
+          <form method="post" action="{{ url_for('warehouses.update_recipient', warehouse_id=wh.id) }}" class="d-flex gap-1">
+            <input type="text" name="recipient_info" value="{{ wh.recipient_info or '' }}" class="form-control form-control-sm" placeholder="Название, адрес, телефон">
+            <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="3" class="text-muted">Склады еще не созданы</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

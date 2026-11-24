@@ -1,0 +1,985 @@
+import contextlib
+import json
+import os
+import secrets
+
+from flask import Flask, current_app, flash, redirect, request, session, url_for
+from flask_login import current_user, logout_user
+from sqlalchemy import event, inspect, select, text
+from sqlalchemy.engine import Engine
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+from .config import Config, INSTANCE_DIR
+from .extensions import db, login_manager
+from .paths import resource_dir
+from .utils.timezone import to_moscow
+
+
+_sqlite_functions_registered = False
+
+
+@contextlib.contextmanager
+def _startup_lock(app):
+    """На сервере gunicorn запускает несколько процессов, и каждый при старте
+    обновляет схему базы и заносит справочники. Без блокировки они делают это
+    одновременно: второй процесс падает (повторная колонка, дубль города), и
+    сервер не поднимается (502). Файловая блокировка пускает их по очереди."""
+    try:
+        import fcntl
+    except ImportError:  # Windows (сборка .exe) — там один процесс
+        yield
+        return
+    os.makedirs(app.instance_path, exist_ok=True)
+    with open(os.path.join(app.instance_path, ".startup.lock"), "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _ensure_columns():
+    """db.create_all() создает только отсутствующие ТАБЛИЦЫ — если в модель
+    существующей таблицы добавили новое поле, на уже работающем сервере (где
+    таблица уже есть, но без этой колонки) оно само не появится, и первый же
+    запрос к нему упадет с "no such column". Здесь по каждой модели сверяем
+    колонки с тем, что реально есть в БД, и недостающие добавляем ALTER TABLE
+    (полноценный Alembic для проекта такого размера избыточен)."""
+    inspector = inspect(db.engine)
+    for table in db.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            col_type = column.type.compile(db.engine.dialect)
+            try:
+                with db.engine.begin() as conn:
+                    conn.execute(
+                        text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {col_type}')
+                    )
+                print(f"[schema] Добавлена колонка {table.name}.{column.name}")
+                if table.name == "movement_documents" and column.name == "received_at":
+                    # До этой версии перемещение засчитывалось в план отгрузок
+                    # сразу по завершении, отдельного подтверждения приемки не
+                    # было. Если считать все уже завершенные документы
+                    # "неполученными" (received_at пуст), кнопка "Принято на
+                    # складе" на них задвоила бы уже учтенное выполнение плана.
+                    # Поэтому именно в момент появления колонки (то есть один
+                    # раз, при обновлении с более старой версии) закрываем ее
+                    # задним числом для всего, что уже было завершено.
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE movement_documents SET received_at = completed_at "
+                                "WHERE status = 'completed' AND received_at IS NULL"
+                            )
+                        )
+                    print("[schema] movement_documents.received_at заполнен для уже завершенных документов")
+                if table.name == "movement_documents" and column.name == "shipped_at":
+                    # Исторические принятые документы точно были переданы
+                    # транспорту. Точное время неизвестно, поэтому для них
+                    # используем завершение сборки как наиболее близкую
+                    # доступную отметку; новые документы фиксируются кнопкой.
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE movement_documents SET shipped_at = completed_at "
+                                "WHERE received_at IS NOT NULL AND shipped_at IS NULL"
+                            )
+                        )
+                    print("[schema] movement_documents.shipped_at заполнен для исторических приемок")
+                if table.name == "warehouses" and column.name == "fulfillment_1c_name":
+                    # Известные соответствия "город -> склад 1С" (см.
+                    # wms.blueprints.warehouses.FULFILLMENT_1C_DEFAULTS) —
+                    # проставляем сразу при появлении колонки на уже
+                    # работающем сервере, чтобы выгрузка перемещений в 1С
+                    # начала разбивать склад-получатель по городу без ручной
+                    # настройки; администратор может поправить на странице
+                    # «Настройки». Новые склады-города, создаваемые после
+                    # этого момента, получают значение сразу при создании
+                    # (см. shipment_plan._get_or_create_city_warehouse), эта
+                    # разовая раскладка нужна только для уже существующих.
+                    from .blueprints.warehouses import FULFILLMENT_1C_DEFAULTS
+
+                    with db.engine.begin() as conn:
+                        for city_key, name_1c in FULFILLMENT_1C_DEFAULTS.items():
+                            conn.execute(
+                                text(
+                                    "UPDATE warehouses SET fulfillment_1c_name = :name_1c "
+                                    "WHERE fulfillment_1c_name IS NULL "
+                                    "AND lower(replace(marketplace_city, 'ё', 'е')) = :city_key"
+                                ),
+                                {"name_1c": name_1c, "city_key": city_key},
+                            )
+                    print(
+                        "[schema] warehouses.fulfillment_1c_name заполнен известными "
+                        "складами 1С по городу"
+                    )
+                if table.name == "boxes" and column.name == "warehouse_arrived_at":
+                    # Точный момент переезда короба на текущий склад для уже
+                    # существующих коробов неизвестен — created_at ближайшая
+                    # доступная оценка (для коробов, которые с тех пор не
+                    # переезжали, она и верна).
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE boxes SET warehouse_arrived_at = created_at "
+                                "WHERE warehouse_arrived_at IS NULL"
+                            )
+                        )
+                    print("[schema] boxes.warehouse_arrived_at заполнен из created_at для уже существующих коробов")
+                if table.name == "users" and column.name == "nomenclature_edit_allowed":
+                    # ALTER TABLE ADD COLUMN не проставляет DEFAULT задним
+                    # числом — у уже существующих пользователей колонка
+                    # окажется NULL. Право редактировать номенклатуру у них
+                    # уже было (это новое ограничение, а не новая
+                    # возможность), поэтому явно проставляем True, а не
+                    # оставляем NULL.
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE users SET nomenclature_edit_allowed = 1 "
+                                "WHERE nomenclature_edit_allowed IS NULL"
+                            )
+                        )
+                    print("[schema] users.nomenclature_edit_allowed заполнен для уже существующих пользователей")
+                if table.name == "users" and column.name == "warehouse_mapping_allowed":
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE users SET warehouse_mapping_allowed = 0 "
+                                "WHERE warehouse_mapping_allowed IS NULL"
+                            )
+                        )
+                    print("[schema] users.warehouse_mapping_allowed заполнен для уже существующих пользователей")
+                if table.name == "users" and column.name == "session_version":
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE users SET session_version = 0 "
+                                "WHERE session_version IS NULL"
+                            )
+                        )
+                    print("[schema] users.session_version заполнен для уже существующих пользователей")
+                if table.name == "users" and column.name == "invoice_receiving_view_allowed":
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE users SET invoice_receiving_view_allowed = 0 "
+                                "WHERE invoice_receiving_view_allowed IS NULL"
+                            )
+                        )
+                    print(
+                        "[schema] users.invoice_receiving_view_allowed заполнен "
+                        "для уже существующих пользователей"
+                    )
+                if table.name == "cells" and column.name == "unlimited":
+                    # Все уже существующие ячейки — обычные, с ограничением
+                    # по вместимости (это новое поле для отдельной
+                    # безлимитной ячейки ряда, см. чат "Размещение в ряды").
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text("UPDATE cells SET unlimited = 0 WHERE unlimited IS NULL")
+                        )
+                    print("[schema] cells.unlimited заполнен для уже существующих ячеек")
+                if table.name == "users" and column.name == "movement_view_allowed":
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE users SET movement_view_allowed = 0 "
+                                "WHERE movement_view_allowed IS NULL"
+                            )
+                        )
+                    print(
+                        "[schema] users.movement_view_allowed заполнен "
+                        "для уже существующих пользователей"
+                    )
+                if table.name == "users" and column.name == "movement_receive_allowed":
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE users SET movement_receive_allowed = movement_complete_allowed "
+                                "WHERE movement_receive_allowed IS NULL"
+                            )
+                        )
+                    print("[schema] users.movement_receive_allowed заполнен для существующих пользователей")
+                if table.name == "users" and column.name == "management_dashboard_allowed":
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE users SET management_dashboard_allowed = 0 "
+                                "WHERE management_dashboard_allowed IS NULL"
+                            )
+                        )
+                    print("[schema] users.management_dashboard_allowed заполнен для существующих пользователей")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[schema] Не удалось добавить {table.name}.{column.name}: {exc}")
+
+
+def _cleanup_zero_receiving_lines():
+    """Однократная чистка старых данных: в приемках по накладной, уже
+    ушедших на разбраковку/завершенных, остались строки с нулем (товар не
+    привезли). В 1С такой строки нет, поэтому сверка показывала расхождение.
+    Теперь такие строки удаляются при переходе на разбраковку (см.
+    receiving._remove_zero_lines); здесь добиваем то, что накопилось раньше.
+    Повторный запуск ничего не меняет."""
+    import json
+
+    from .models import ReceivingDocument, ReceivingLine
+
+    docs = (
+        ReceivingDocument.query.filter(
+            ReceivingDocument.invoice_file_name.isnot(None),
+            ReceivingDocument.status.in_(("sorting", "completed")),
+        ).all()
+    )
+    cleaned = 0
+    for doc in docs:
+        zero_lines = [
+            line for line in doc.lines.all()
+            if (line.qty or 0) <= 0 and not line.box_id and (line.defect_qty or 0) <= 0
+        ]
+        if not zero_lines:
+            continue
+        removed = list(doc.removed_zero_items())
+        for line in zero_lines:
+            if line.expected_qty is not None:
+                removed.append({
+                    "barcode": line.nomenclature.barcode,
+                    "name": line.nomenclature.name,
+                    "expected_qty": line.expected_qty,
+                })
+            db.session.delete(line)
+            cleaned += 1
+        doc.removed_zero_lines = json.dumps(removed, ensure_ascii=False)
+    if cleaned:
+        db.session.commit()
+        print(f"[schema] удалено строк с нулевым количеством в приемках по накладной: {cleaned}")
+
+
+def _ensure_indexes():
+    """Аналогично _ensure_columns(), но для индексов: index=True в модели
+    заставляет create_all() создать индекс только для НОВОЙ таблицы — для
+    уже существующей (обычный случай на работающем сервере) create_all()
+    таблицу не трогает вообще, и индекс, добавленный в код позже, сам по
+    себе на старой базе не появится. Без него запрос, для которого индекс
+    и добавляли, продолжит делать полное сканирование таблицы — тем
+    медленнее, чем больше в ней строк успело накопиться.
+    CREATE INDEX IF NOT EXISTS идемпотентен, поэтому просто повторяем его
+    при каждом старте вместо сверки с уже существующими индексами."""
+    inspector = inspect(db.engine)
+    for table in db.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            continue
+        for column in table.columns:
+            if not column.index:
+                continue
+            index_name = f"ix_{table.name}_{column.name}"
+            try:
+                with db.engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f'CREATE INDEX IF NOT EXISTS "{index_name}" '
+                            f'ON "{table.name}" ("{column.name}")'
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[schema] Не удалось создать индекс {index_name}: {exc}")
+
+    # Идемпотентность добавления товара требует именно уникальности токена,
+    # в том числе на базах, где колонка появилась через ALTER TABLE.
+    if inspector.has_table("receiving_lines"):
+        try:
+            with db.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        '"uq_receiving_lines_request_token" '
+                        'ON "receiving_lines" ("request_token")'
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[schema] Не удалось создать индекс токенов приемки: {exc}")
+
+    # Один короб не должен попадать в один и тот же документ перемещения
+    # дважды (add_box/route_box_add и так проверяют это перед вставкой, но
+    # два одновременных запроса могут оба пройти проверку раньше, чем
+    # первый успеет закоммититься — см. чат: "экспорт показывает 2220, в
+    # перемещении 2147", ровно такая гонка задвоила короб в документе).
+    # На базе, где дубль уже есть, создание индекса не пройдет — тогда
+    # просто логируем и не падаем, дубль по-прежнему виден и его нужно
+    # почистить вручную.
+    if inspector.has_table("movement_lines"):
+        try:
+            with db.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        '"uq_movement_lines_document_box" '
+                        'ON "movement_lines" ("document_id", "box_id")'
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                "[schema] Не удалось создать индекс уникальности короба в "
+                f"перемещении (возможно, в базе уже есть дубли): {exc}"
+            )
+
+
+def _ensure_mvb_lines():
+    """МВБ: заявки, созданные до появления направлений, получают одно
+    направление по своим полям; их короба и план рейса переносятся на него.
+    Повторный запуск ничего не делает."""
+    from .models import MvbBox, MvbOrder, MvbOrderLine
+
+    orders = MvbOrder.query.filter(~MvbOrder.lines.any()).all()
+    for order in orders:
+        line = MvbOrderLine(
+            seq=1,
+            marketplace=order.marketplace or "wb",
+            destination=order.destination,
+            slot_date=order.slot_date,
+            box_count=order.box_count or len(order.boxes) or 1,
+            planned_trip_id=order.planned_trip_id,
+            wms_movement_id=order.wms_movement_id,
+        )
+        order.lines.append(line)
+        for box in order.boxes:
+            box.line = line
+    if orders:
+        db.session.commit()
+        print(f"[schema] МВБ: направления созданы для заявок — {len(orders)}")
+    orphan = MvbBox.query.filter(MvbBox.line_id.is_(None)).count()
+    if orphan:
+        for box in MvbBox.query.filter(MvbBox.line_id.is_(None)).all():
+            if box.order.lines:
+                box.line = box.order.lines[0]
+        db.session.commit()
+
+
+def _ensure_mvb_destinations():
+    """МВБ: справочник городов с прайсом + пункты назначения.
+    - старые адреса города (общие для WB / Ozon) переносятся в пункты
+      назначения WB / Ozon, адреса у города очищаются;
+    - у каждого пункта назначения есть город в справочнике;
+    - прайс, заведенный на пункт назначения, переезжает на его город."""
+    from .models import MvbCity, MvbDestination, MvbPriceTier
+
+    changed = 0
+    for city in MvbCity.query.all():
+        if not (city.address_wb or city.address_ozon or city.address):
+            continue
+        for marketplace, address in (("wb", city.address_wb or city.address), ("ozon", city.address_ozon)):
+            if not address and marketplace == "ozon":
+                continue
+            if not MvbDestination.query.filter_by(marketplace=marketplace, city=city.name, ff_name=None).first():
+                db.session.add(MvbDestination(marketplace=marketplace, city=city.name, address=address,
+                                              is_active=city.is_active))
+        city.address_wb = city.address_ozon = city.address = None
+        changed += 1
+    db.session.flush()
+
+    for dest in MvbDestination.query.all():
+        if MvbCity.find(dest.city) is None:
+            db.session.add(MvbCity(name=dest.city))
+            db.session.flush()
+            changed += 1
+
+    for tier in MvbPriceTier.query.filter(MvbPriceTier.destination_id.isnot(None)).all():
+        dest = db.session.get(MvbDestination, tier.destination_id)
+        city = MvbCity.find(dest.city) if dest else None
+        tier.destination_id = None
+        if city is None or tier.city_id:
+            db.session.delete(tier)
+        elif MvbPriceTier.query.filter_by(kind=tier.kind, city_id=city.id, min_boxes=tier.min_boxes).first():
+            db.session.delete(tier)  # у города уже есть такая ступень
+        else:
+            tier.city_id = city.id
+        changed += 1
+    if changed:
+        db.session.commit()
+        print(f"[schema] МВБ: справочник городов и прайс по городам обновлены — {changed}")
+
+
+# Прайс MWB по умолчанию (прайсы WB и Ozon от 2026-10-03): ступени «от N
+# коробов — цена за короб» по городу и пункты назначения в нем.
+MVB_DEFAULT_TIERS = {
+    "msk": [(1, 550), (11, 420)],
+    "kzn": [(1, 600), (11, 420)],
+    "sib": [(1, 1050), (11, 870), (16, 790)],
+    "ekb": [(1, 950), (11, 750), (16, 690)],
+    "vlg": [(1, 450), (11, 400)],
+    "spb": [(1, 750), (11, 550)],
+    "ady": [(1, 300), (11, 250)],
+    "thk": [(1, 300)],
+    "nev": [(1, 150)],
+}
+MVB_DEFAULT_CITIES = [
+    # город, ступени, маркетплейсы
+    ("Гривно", "msk", ("ozon",)),
+    ("Ногинск", "msk", ("ozon",)),
+    ("Софьино", "msk", ("ozon",)),
+    ("Хоругвино", "msk", ("ozon",)),
+    ("Пушкино", "msk", ("ozon",)),
+    ("Домодедово", "msk", ("ozon",)),
+    ("Петровское", "msk", ("ozon",)),
+    ("Чашниково", "msk", ("wb",)),
+    ("Радумля", "msk", ("wb",)),
+    ("Никольское", "msk", ("wb",)),
+    ("Щеглово", "msk", ("wb",)),
+    ("Подольск 4", "msk", ("wb",)),
+    ("Домодедово 2", "msk", ("wb",)),
+    ("Казань", "kzn", ("wb", "ozon")),
+    ("Самара", "kzn", ("wb",)),
+    ("Новосибирск", "sib", ("wb", "ozon")),
+    ("Омск", "sib", ("wb", "ozon")),
+    ("Екатеринбург", "ekb", ("wb", "ozon")),
+    ("Волгоград", "vlg", ("ozon",)),
+    ("Санкт-Петербург", "spb", ("ozon",)),
+    ("Бугры", "spb", ("ozon",)),
+    ("Шушары", "spb", ("wb", "ozon")),
+    ("Колпино", "spb", ("ozon",)),
+    ("Порошкино", "spb", ("ozon",)),
+    ("Адыгейск", "ady", ("ozon",)),
+    ("Тахтамукай", "thk", ("wb",)),
+    ("Невинномысск", "nev", ("wb", "ozon")),
+]
+MVB_DEFAULT_PICKUP_ZONES = [("Черкесск", 1000), ("Регионы", 1500), ("Хабез", 1800), ("Отрадная", 2800)]
+
+
+def _mvb_preset_schedule_v1(marketplace, destination):
+    """Предыдущая предустановка — нужна для безопасного обновления v2."""
+    name = " ".join((destination or "").lower().replace("ё", "е").split())
+    weekday_chain = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
+    common_long = {0: 3, 1: 5, 2: 5, 3: 0, 4: 0}
+    ekaterinburg = {0: 0, 1: 0, 2: 0, 3: 3, 4: 3}
+
+    if marketplace == "ozon":
+        if any(value in name for value in ("гривно", "софьино", "софино", "ногинск", "хоругвино", "пушкино", "домодедово")):
+            return common_long
+        if "петровск" in name:
+            return {0: 3}
+        if "казан" in name:
+            return common_long
+        if "ростов" in name:
+            return {0: 3, 1: 3, 2: 5, 3: 5}
+        if any(value in name for value in ("санкт-петербург", "спб", "бугры", "шушары")):
+            return {0: 5, 1: 5, 2: 5}
+        if any(value in name for value in ("колпино", "порошкино")):
+            return {3: 2, 4: 2}
+        if "невинномыс" in name:
+            return weekday_chain
+        if "екатеринбург" in name:
+            return ekaterinburg
+        if "адыгейск" in name:
+            return {0: 1, 2: 3, 4: 5}
+    elif marketplace == "wb":
+        if any(value in name for value in ("чашников", "радумл", "никольск", "щеглов", "подольск", "домодедово", "коледино")):
+            return common_long
+        if "истра" in name:
+            return {0: 4}
+        if "мичуринск" in name:
+            return {0: 3}
+        if "рязан" in name:
+            return {0: 4}
+        if any(value in name for value in ("казан", "столбищ", "самар")):
+            return common_long
+        if "тахтамукай" in name:
+            return {0: 1, 2: 3, 4: 5}
+        if "невинномыс" in name:
+            return {**weekday_chain, 5: 6}
+        if "екатеринбург" in name:
+            return ekaterinburg
+        if "шушар" in name:
+            return {0: 5, 1: 5, 3: 2, 4: 2}
+    elif marketplace == "yandex":
+        if "соф" in name:
+            return {0: 4, 1: 4}
+        if "ростов" in name:
+            return {0: 3, 1: 3}
+    elif marketplace == "lamoda" and any(value in name for value in ("соф", "быково")):
+        return {0: 4, 1: 4}
+    return None
+
+
+def _mvb_preset_schedule(marketplace, destination):
+    """Актуальный график с изображений от 11.11.2026.
+
+    Возвращает соответствие «день отправки → день выгрузки», где 0=пн …
+    6=вс. Несколько пунктов из одной группы имеют одинаковый график. Названия
+    в базе могут содержать «СЦ», «РФЦ» и номер площадки, поэтому ищем по
+    устойчивой части названия.
+    """
+    name = " ".join((destination or "").lower().replace("ё", "е").split())
+    common_long = {0: 3, 1: 5, 2: 5, 3: 0, 4: 0, 5: 2}
+    weekday_chain = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6}
+    ekaterinburg = {0: 1, 1: 1, 2: 1, 3: 4, 4: 4, 5: 4}
+    northwest = {0: 4, 1: 4, 2: 0, 3: 0}
+
+    if marketplace == "ozon":
+        if any(value in name for value in (
+            "гривно", "софьино", "софино", "ногинск", "хоругвино",
+            "пушкино", "домодедово", "петровск", "ватутинк", "жуковск",
+        )):
+            return common_long
+        if "казан" in name:
+            return {0: 3, 1: 5, 2: 0, 3: 0}
+        if "ростов" in name:
+            return {0: 2, 1: 3, 2: 4}
+        if any(value in name for value in ("колпино", "порошкино")):
+            return {2: 1, 3: 1}
+        if any(value in name for value in (
+            "санкт-петербург", "спб", "софийск", "бугры", "шушар",
+        )):
+            return {0: 6, 1: 6}
+        if "невинномыс" in name:
+            return weekday_chain
+        if "краснодар" in name:
+            return {0: 1, 2: 3, 4: 5}
+        if "екатеринбург" in name:
+            return ekaterinburg
+        if "воронеж" in name:
+            return {0: 2, 1: 4, 3: 6, 4: 6, 5: 1}
+        if any(value in name for value in ("ярослав", "твер", "нижн", "новгород")):
+            return northwest
+        if "уфа" in name:
+            return {0: 3, 1: 3, 2: 3, 3: 3, 4: 3}
+    elif marketplace == "wb":
+        if any(value in name for value in (
+            "обухов", "радумл", "никольск", "подольск", "домодедово",
+            "коледино", "тула", "истра", "ногинск",
+        )):
+            return common_long
+        if any(value in name for value in ("рязан", "ярослав", "владимир", "твер")):
+            return northwest
+        if any(value in name for value in ("казан", "столбищ", "самар")):
+            return {0: 3, 1: 5, 2: 0, 3: 0}
+        if "крыловск" in name:
+            return {0: 2, 1: 3, 2: 4}
+        if "тахтамукай" in name:
+            return {0: 1, 2: 3, 4: 5}
+        if "невинномыс" in name:
+            return weekday_chain
+        if any(value in name for value in ("екатеринбург", "перспектив", "черняхов")):
+            return ekaterinburg
+        if "шушар" in name:
+            return {0: 6, 1: 6, 2: 1, 3: 1}
+    elif marketplace == "yandex":
+        if "соф" in name:
+            return {0: 4, 1: 4}
+        if "ростов" in name:
+            return {0: 3, 1: 3}
+    elif marketplace == "lamoda" and any(value in name for value in ("соф", "быково")):
+        return {0: 4, 1: 4}
+    return None
+
+
+def _seed_mvb_default_schedules():
+    """Ставит v3 графиков, принудительно применяя новую предустановку.
+
+    Для направлений из нового файла заменяем в том числе ручные настройки.
+    Неизвестные направления оставляем для ручного выбора. Если направление
+    исчезло из файла, снимаем только прежнюю автоматическую настройку v1.
+    """
+    from .models import AppSetting, MvbDestination
+
+    # Новая версия ключа нужна, чтобы обновление выполнилось и на сервере, где
+    # предыдущая предустановка v2 уже успела примениться.
+    key = "mvb_default_delivery_schedules_v3"
+    if db.session.get(AppSetting, key) is not None:
+        return
+    changed = 0
+    for destination in MvbDestination.query.all():
+        schedule = _mvb_preset_schedule(destination.marketplace, destination.value)
+        old_schedule = _mvb_preset_schedule_v1(destination.marketplace, destination.value)
+        try:
+            current = json.loads(destination.schedule_json) if destination.schedule_json else None
+        except (TypeError, ValueError):
+            current = None
+        old_json = {str(day): delivery for day, delivery in (old_schedule or {}).items()}
+        if schedule:
+            new_json = json.dumps(schedule, ensure_ascii=False)
+            if destination.schedule_json != new_json:
+                destination.schedule_json = new_json
+                changed += 1
+        else:
+            # Направление исчезло из нового файла: убираем только прежнюю
+            # автоматическую настройку, ручную не трогаем.
+            if current and old_schedule and current == old_json:
+                destination.schedule_json = None
+                changed += 1
+    db.session.add(AppSetting(key=key, value="1"))
+    db.session.commit()
+    print(f"[schema] МВБ: предустановлен график поставок — {changed} направлений")
+
+
+def _seed_mvb_default_prices():
+    """Один раз заносит прайс MWB по умолчанию: города с прайсом, пункты
+    назначения WB / Ozon и зоны забора. То, что оператор уже завел, не
+    трогает (город со своим прайсом, существующий пункт, уже заданные
+    зоны); после первого запуска больше не срабатывает — удаленное
+    оператором не возвращается."""
+    from .models import AppSetting, MvbCity, MvbDestination, MvbPickupZone, MvbPriceTier
+
+    key = "mvb_default_prices_v1"
+    if db.session.get(AppSetting, key) is not None:
+        return
+    for name, tiers_key, marketplaces in MVB_DEFAULT_CITIES:
+        city = MvbCity.find(name)
+        if city is None:
+            city = MvbCity(name=name)
+            db.session.add(city)
+            db.session.flush()
+        if not MvbPriceTier.query.filter_by(kind="sc", city_id=city.id).first():
+            for min_boxes, price in MVB_DEFAULT_TIERS[tiers_key]:
+                db.session.add(MvbPriceTier(kind="sc", city_id=city.id, min_boxes=min_boxes, price_per_box=price))
+        for marketplace in marketplaces:
+            if MvbDestination.find(marketplace, city.name) is None:
+                db.session.add(MvbDestination(marketplace=marketplace, city=city.name))
+        db.session.flush()
+    if not MvbPickupZone.query.first():
+        for name, price in MVB_DEFAULT_PICKUP_ZONES:
+            db.session.add(MvbPickupZone(name=name, price=price))
+    db.session.add(AppSetting(key=key, value="1"))
+    db.session.commit()
+    print("[schema] МВБ: занесен прайс по умолчанию (города, пункты WB/Ozon, зоны забора)")
+
+
+def _register_sqlite_tuning():
+    """SQLite-специфичные настройки:
+    - LOWER/UPPER на Python-реализации (сравнение LIKE/ILIKE по умолчанию
+      регистронезависимо только для ASCII, кириллица иначе не находится);
+    - WAL-режим и busy_timeout — чтобы несколько пользователей одновременно
+      (несколько ПК и телефонов) не ловили "database is locked", а запись
+      просто немного подождала своей очереди вместо мгновенной ошибки.
+
+    Слушатель "connect" глобальный (на весь процесс, а не на конкретный
+    Engine) — если в этом же процессе когда-нибудь подключится не-SQLite
+    БД (Postgres), dbapi_connection у нее не будет иметь create_function,
+    и это же отличие используем, чтобы не выполнять на ней PRAGMA (там их
+    нет и это синтаксическая ошибка) и не регистрировать функции."""
+    global _sqlite_functions_registered
+    if _sqlite_functions_registered:
+        return
+    _sqlite_functions_registered = True
+
+    @event.listens_for(Engine, "connect")
+    def _on_connect(dbapi_connection, connection_record):  # noqa: ANN001
+        if not hasattr(dbapi_connection, "create_function"):
+            return  # не SQLite (например, Postgres) — PRAGMA/функции здесь не применимы
+
+        dbapi_connection.create_function(
+            "LOWER", 1, lambda s: s.lower() if s is not None else None
+        )
+        dbapi_connection.create_function(
+            "UPPER", 1, lambda s: s.upper() if s is not None else None
+        )
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+
+
+def _bootstrap_admin():
+    """Если пользователей еще нет (первый запуск) — создает администратора
+    со случайным паролем и печатает его в консоль. Больше пароль нигде не
+    хранится в открытом виде — при необходимости его можно сбросить в
+    разделе «Пользователи»."""
+    from .models import User
+
+    if User.query.count() > 0:
+        return
+
+    # Демо-режим (WMS_DEMO=1): пароль известен заранее ("demo", см.
+    # demo_data.py) и печатать случайный не нужно — он бы только запутал.
+    if current_app.config.get("DEMO_MODE"):
+        admin = User(username="admin", full_name="Администратор", is_admin=True)
+        admin.set_password("demo")
+        db.session.add(admin)
+        db.session.commit()
+        return
+
+    password = secrets.token_urlsafe(8)
+    admin = User(username="admin", full_name="Администратор", is_admin=True)
+    admin.set_password(password)
+    db.session.add(admin)
+    db.session.commit()
+
+    print("=" * 60)
+    print("Создан первый пользователь администратора:")
+    print("  Логин:  admin")
+    print(f"  Пароль: {password}")
+    print("Сохраните этот пароль — он больше нигде не показывается.")
+    print("Сменить его можно после входа или в разделе «Пользователи».")
+    print("=" * 60)
+
+
+# Эндпоинты вне приемки/перемещений, доступные роли "фулфилмент" (см. чат:
+# видят свой склад, печатают стикеры своих коробов, видят общую номенклатуру,
+# при приемке подтягивается вся номенклатура). Только чтение и печать; кто
+# какие именно короба может открыть — проверяется в самих view по складу
+# пользователя.
+FULFILLMENT_EXTRA_ENDPOINTS = frozenset(
+    {
+        # подсказки/сканирование при приемке и перемещении
+        "api.search_nomenclature",
+        "api.nomenclature_by_barcode",
+        "api.box_by_number",
+        # общая номенклатура (остаток — только своего склада)
+        "nomenclature.list_nomenclature",
+        # короба своего склада и печать их стикеров
+        "boxes.list_boxes",
+        "boxes.detail",
+        "labels.box_label",
+        "labels.box_label_pdf",
+        "labels.boxes_label_batch_pdf",
+        "labels.box_items_labels",
+    }
+)
+
+
+def create_app(config_class=Config):
+    os.makedirs(INSTANCE_DIR, exist_ok=True)
+
+    _register_sqlite_tuning()
+
+    app = Flask(
+        __name__,
+        template_folder=resource_dir("templates"),
+        static_folder=resource_dir("static"),
+    )
+    app.config.from_object(config_class)
+
+    # Все даты в БД хранятся в UTC (datetime.utcnow() по всей модели) —
+    # шаблоны показывают их через этот фильтр в московском времени, а не
+    # как есть, чтобы время в списках документов совпадало с реальным
+    # часовым поясом склада.
+    app.jinja_env.filters["msk"] = to_moscow
+    # Количество без лишнего «.0»: 12.0 -> 12, 1.5 -> 1.5.
+    app.jinja_env.filters["qty"] = lambda v: f"{float(v or 0):g}"
+
+    if app.config.get("BEHIND_PROXY"):
+        # За nginx: доверяем X-Forwarded-For/-Proto/-Host от ровно одного
+        # прокси перед приложением, чтобы Flask видел правильную схему
+        # (https) и IP клиента вместо адреса самого nginx.
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+    db.init_app(app)
+    login_manager.init_app(app)
+
+    from .blueprints.auth import bp as auth_bp
+    from .blueprints.main import bp as main_bp
+    from .blueprints.warehouses import bp as warehouses_bp
+    from .blueprints.nomenclature import bp as nomenclature_bp
+    from .blueprints.receiving import bp as receiving_bp
+    from .blueprints.placement import bp as placement_bp
+    from .blueprints.movement import bp as movement_bp
+    from .blueprints.inventory import bp as inventory_bp
+    from .blueprints.boxes import bp as boxes_bp
+    from .blueprints.labels import bp as labels_bp
+    from .blueprints.reports import bp as reports_bp
+    from .blueprints.receipt_audit import bp as receipt_audit_bp
+    from .blueprints.api import bp as api_bp
+    from .blueprints.shipment_plan import bp as shipment_plan_bp
+    from .blueprints.box_picking import bp as box_picking_bp
+    from .blueprints.onboarding import bp as onboarding_bp
+    from .blueprints.marketplace_export import bp as marketplace_export_bp
+    from .blueprints.management import bp as management_bp
+
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(main_bp)
+    app.register_blueprint(warehouses_bp, url_prefix="/warehouses")
+    app.register_blueprint(nomenclature_bp, url_prefix="/nomenclature")
+    app.register_blueprint(receiving_bp, url_prefix="/receiving")
+    app.register_blueprint(placement_bp, url_prefix="/placement")
+    app.register_blueprint(movement_bp, url_prefix="/movement")
+    app.register_blueprint(inventory_bp, url_prefix="/inventory")
+    app.register_blueprint(boxes_bp, url_prefix="/boxes")
+    app.register_blueprint(labels_bp, url_prefix="/labels")
+    app.register_blueprint(reports_bp, url_prefix="/reports")
+    app.register_blueprint(box_picking_bp, url_prefix="/box-picking")
+    app.register_blueprint(receipt_audit_bp, url_prefix="/movement-audit")
+    app.register_blueprint(api_bp, url_prefix="/api")
+    app.register_blueprint(shipment_plan_bp, url_prefix="/shipment-plan")
+    if app.config.get("ENABLE_PRODUCTION"):
+        from .blueprints.production import bp as production_bp
+        from .blueprints.production_orders import bp as production_orders_bp
+
+        app.register_blueprint(production_bp, url_prefix="/production")
+        app.register_blueprint(production_orders_bp, url_prefix="/production-orders")
+    if app.config.get("ENABLE_1C_INTEGRATION"):
+        from .blueprints.integration_1c import bp as integration_1c_bp
+
+        app.register_blueprint(integration_1c_bp, url_prefix="/integrations/1c")
+    if app.config.get("ENABLE_MARKETPLACE_API"):
+        from .blueprints.integration_ozon import bp as integration_ozon_bp
+        from .blueprints.integration_wb import bp as integration_wb_bp
+
+        app.register_blueprint(integration_ozon_bp, url_prefix="/integrations/ozon")
+        app.register_blueprint(integration_wb_bp, url_prefix="/integrations/wb")
+    if not app.config.get("STANDALONE_COMPANY_MODE"):
+        app.register_blueprint(onboarding_bp, url_prefix="/onboarding")
+    app.register_blueprint(marketplace_export_bp, url_prefix="/marketplace-export")
+    app.register_blueprint(management_bp, url_prefix="/management")
+    if app.config.get("ENABLE_MVB_LOGISTICS"):
+        from .blueprints.mvb import bp as mvb_bp
+
+        app.register_blueprint(mvb_bp, url_prefix="/mvb")
+
+    with app.app_context(), _startup_lock(app):
+        from . import models  # noqa: F401
+        from .utils.categorize import bootstrap_categories
+
+        db.create_all()
+        _ensure_columns()
+        _ensure_indexes()
+        _cleanup_zero_receiving_lines()
+        if app.config.get("ENABLE_MVB_LOGISTICS"):
+            _ensure_mvb_lines()
+            _ensure_mvb_destinations()
+            if not app.config.get("TESTING"):
+                _seed_mvb_default_prices()
+                _seed_mvb_default_schedules()
+        _bootstrap_admin()
+        bootstrap_categories()
+
+    @login_manager.user_loader
+    def load_user(user_id):
+        from .models import User
+
+        return User.query.get(int(user_id))
+
+    @app.before_request
+    def require_login():
+        from .blueprints.shipment_plan import GOOGLE_SHEETS_PUBLIC_ENDPOINTS
+        from .models import User
+
+        API_1C_PUBLIC_ENDPOINTS = set()
+        PRODUCTION_ORDERS_PUBLIC_ENDPOINTS = set()
+        MVB_PUBLIC_ENDPOINTS = set()
+        if app.config.get("ENABLE_1C_INTEGRATION"):
+            from .blueprints.integration_1c import API_1C_PUBLIC_ENDPOINTS
+        if app.config.get("ENABLE_PRODUCTION"):
+            from .blueprints.production_orders import (
+                GOOGLE_SHEETS_PUBLIC_ENDPOINTS as PRODUCTION_ORDERS_PUBLIC_ENDPOINTS,
+            )
+        if app.config.get("ENABLE_MVB_LOGISTICS"):
+            from .blueprints.mvb import MVB_PUBLIC_ENDPOINTS
+
+        if request.endpoint is None:
+            return None
+        if current_user.is_authenticated:
+            cookie_version = session.get("session_version")
+            # Читаем скалярным запросом прямо из БД, а не из уже загруженного
+            # объекта current_user: так отзыв сессий сразу виден и при
+            # нескольких процессах приложения.
+            current_version = (
+                db.session.execute(
+                    select(User.session_version).where(User.id == current_user.id)
+                ).scalar_one()
+                or 0
+            )
+            # Тесты старых маршрутов подставляют _user_id напрямую, без
+            # настоящего login_user. В рабочем приложении отсутствие версии
+            # означает старую/недействительную cookie и требует нового входа.
+            if cookie_version is None and app.testing:
+                session["session_version"] = current_version
+            elif cookie_version != current_version:
+                logout_user()
+                session.pop("session_version", None)
+                flash("Сессия завершена администратором. Войдите снова.", "warning")
+                if app.config.get("ENABLE_MVB_LOGISTICS") and request.endpoint.startswith("mvb."):
+                    return redirect(url_for("mvb.login"))
+                return redirect(url_for("auth.login"))
+        # Страницы WMS из auth.* (настройки, смена пароля) пользователям МВБ
+        # тоже не показываем — только выход.
+        if app.config.get("ENABLE_MVB_LOGISTICS") and (
+            current_user.is_authenticated
+            and current_user.is_mvb_user()
+            and request.endpoint.startswith("auth.")
+            and request.endpoint != "auth.logout"
+        ):
+            return redirect(url_for("mvb.index"))
+        if (
+            request.endpoint == "static"
+            or request.endpoint.startswith("auth.")
+            or request.endpoint in API_1C_PUBLIC_ENDPOINTS
+            or request.endpoint in GOOGLE_SHEETS_PUBLIC_ENDPOINTS
+            or request.endpoint in PRODUCTION_ORDERS_PUBLIC_ENDPOINTS
+            or request.endpoint in MVB_PUBLIC_ENDPOINTS
+        ):
+            return None
+        if not current_user.is_authenticated:
+            # У «МВБ Логистики» своя страница входа.
+            if app.config.get("ENABLE_MVB_LOGISTICS") and request.endpoint.startswith("mvb."):
+                return redirect(url_for("mvb.login"))
+            return redirect(url_for("auth.login", next=request.full_path))
+        # Пользователи МВБ Логистики видят только свой раздел /mvb, остальной
+        # WMS им недоступен (доступ к /mvb для пользователей WMS проверяет
+        # сам blueprint mvb).
+        if app.config.get("ENABLE_MVB_LOGISTICS") and current_user.is_mvb_user():
+            if request.endpoint.startswith("mvb."):
+                return None
+            return redirect(url_for("mvb.index"))
+        # Роль "производство" — доступ только к сканированию ЧЗ, ничего
+        # больше (даже при прямом вводе адреса другой страницы) — кроме
+        # страницы обучения, она должна быть доступна всем сотрудникам
+        # независимо от роли.
+        if app.config.get("ENABLE_PRODUCTION") and (
+            current_user.is_production_only()
+            and not request.endpoint.startswith("production.")
+            and not request.endpoint.startswith("onboarding.")
+        ):
+            return redirect(url_for("production.index"))
+        # Роль "логист" — доступ только к перемещениям, ожидающим транспорт
+        # (movement.transport_list/transport_export_summary), ничего больше
+        # в WMS, см. чат. Эндпоинты этой роли специально названы с общим
+        # префиксом "movement.transport", чтобы не перечислять их по одному.
+        if (
+            current_user.is_logist_only()
+            and not request.endpoint.startswith("movement.transport")
+            and not request.endpoint.startswith("onboarding.")
+        ):
+            return redirect(url_for("movement.transport_list"))
+        # Роль "фулфилмент" — приемка и перемещения своего склада (видимость
+        # внутри самих разделов дополнительно сужается по warehouse_id, см.
+        # receiving._visible_receiving_query/movement._visible_movement_query),
+        # плюс точечный список FULFILLMENT_EXTRA_ENDPOINTS: подсказки
+        # номенклатуры при приемке, общая номенклатура (только просмотр),
+        # короба своего склада и печать их стикеров (см. чат). Остальное
+        # закрыто.
+        if (
+            current_user.is_fulfillment_only()
+            and not request.endpoint.startswith("receiving.")
+            and not request.endpoint.startswith("movement.")
+            and not request.endpoint.startswith("onboarding.")
+            and request.endpoint not in FULFILLMENT_EXTRA_ENDPOINTS
+        ):
+            return redirect(url_for("receiving.list_documents"))
+        # Точечное ограничение разделов (см. User.allowed_sections) — тоже
+        # проверяем при прямом вводе адреса, не только скрываем пункт меню.
+        section = request.endpoint.split(".")[0]
+        if not current_user.has_section_access(section):
+            flash("Этот раздел вам не доступен — обратитесь к администратору", "danger")
+            return redirect(url_for("main.index"))
+        return None
+
+    @app.context_processor
+    def inject_globals():
+        from datetime import datetime
+
+        from .models import CELL_CAPACITY
+
+        return {
+            "current_year": datetime.now().year,
+            "CELL_CAPACITY": CELL_CAPACITY,
+            "demo_mode": app.config.get("DEMO_MODE", False),
+            "standalone_company_mode": app.config.get("STANDALONE_COMPANY_MODE", False),
+            "marketplace_api_enabled": app.config.get("ENABLE_MARKETPLACE_API", False),
+            "one_c_integration_enabled": app.config.get("ENABLE_1C_INTEGRATION", False),
+            "mvb_logistics_enabled": app.config.get("ENABLE_MVB_LOGISTICS", False),
+        }
+
+    return app

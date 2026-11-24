@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Короб {{ box.box_number }}{% endblock %}
+{% block content %}
+<h3 class="mb-1">Короб {{ box.box_number }}
+  <span class="badge badge-status-{{ box.status }}">{{ 'Расставлен' if box.status == 'stored' else 'Открыт' }}</span>
+</h3>
+<div class="text-muted mb-4">
+  Склад: {{ box.warehouse.name if box.warehouse else '—' }}
+  {% if box.cell %}
+    · Ячейка: {% if not current_user.is_fulfillment_only() %}<a href="{{ url_for('warehouses.cell_detail', cell_id=box.cell.id) }}">{{ box.cell.code }}</a>{% else %}{{ box.cell.code }}{% endif %}
+  {% elif box.zone %}
+    · Ряд: {{ box.zone.code }} (без ячейки)
+  {% else %}
+    · не расставлен
+  {% endif %}
+  {% if box.last_scanned_at %}
+    · Последнее сканирование: {{ (box.last_scanned_at|msk).strftime('%d.%m.%Y %H:%M') }}{% if box.last_scanned_by %} ({{ box.last_scanned_by.display_name() }}){% endif %}
+  {% endif %}
+</div>
+
+<div class="mb-4">
+  <a class="btn btn-outline-secondary" target="_blank" href="{{ url_for('labels.box_label', box_id=box.id) }}">🖨 Этикетка короба</a>
+  {% if items %}
+  <a class="btn btn-outline-secondary" target="_blank" href="{{ url_for('labels.box_items_labels', box_id=box.id) }}">🖨 Этикетки товаров</a>
+  {% endif %}
+</div>
+
+<div class="card p-3" style="max-width:760px">
+  <h5>Товары в коробе</h5>
+  {% if current_user.is_admin %}
+  <p class="text-muted small">Правки здесь меняют только сам короб (что физически внутри) — приемку, размещение и другие документы, которыми товар туда попал, задним числом не трогают.</p>
+  {% endif %}
+  <table class="table table-sm mb-0">
+    <thead><tr><th>Товар</th><th>Артикул</th><th>Кол-во</th>{% if current_user.is_admin %}<th></th>{% endif %}</tr></thead>
+    <tbody>
+    {% for it in items %}
+      <tr>
+        <td>{{ it.nomenclature.name }}</td>
+        <td>{{ it.nomenclature.sku }}</td>
+        {% if current_user.is_admin %}
+        <td style="min-width:160px">
+          <form method="post" action="{{ url_for('boxes.update_item', box_id=box.id, item_id=it.id) }}" class="d-flex gap-1">
+            <input type="number" name="qty" step="0.001" min="0.001" value="{{ it.qty }}" class="form-control form-control-sm" style="width:100px">
+            <span class="align-self-center small text-muted">{{ it.nomenclature.unit }}</span>
+            <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+          </form>
+        </td>
+        <td class="d-flex gap-1">
+          <form method="post" action="{{ url_for('boxes.delete_item', box_id=box.id, item_id=it.id) }}" onsubmit="return confirm('Удалить {{ it.nomenclature.name }} из короба?');">
+            <button type="submit" class="btn btn-sm btn-outline-danger">✕</button>
+          </form>
+        </td>
+        {% else %}
+        <td>{{ it.qty }} {{ it.nomenclature.unit }}</td>
+        {% endif %}
+      </tr>
+    {% else %}
+      <tr><td colspan="{{ 5 if current_user.is_admin else 3 }}" class="text-muted">Короб пуст</td></tr>
+    {% endfor %}
+    </tbody>
+    {% if items %}
+    <tfoot>
+      <tr class="fw-bold"><td colspan="2">Итого</td><td colspan="{{ 3 if current_user.is_admin else 1 }}">{{ box.total_qty() }}</td></tr>
+    </tfoot>
+    {% endif %}
+  </table>
+
+  {% if current_user.is_admin %}
+  <hr>
+  <h6>Добавить товар</h6>
+  <form method="post" action="{{ url_for('boxes.add_item', box_id=box.id) }}" class="row g-2 align-items-end">
+    <div class="col-md-7">
+      <label class="form-label">Товар</label>
+      <div class="autocomplete-box" data-autocomplete-nomenclature>
+        <input type="text" class="form-control ac-input" placeholder="Артикул, наименование или штрихкод..." autocomplete="off">
+        <input type="hidden" class="ac-value" name="nomenclature_id" required>
+        <div class="autocomplete-list"></div>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">Кол-во</label>
+      <input type="number" step="0.001" min="0.001" name="qty" class="form-control" value="1" required>
+    </div>
+    <div class="col-md-2">
+      <button type="submit" class="btn btn-primary w-100">Добавить</button>
+    </div>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

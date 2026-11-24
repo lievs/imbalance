@@ -1,0 +1,262 @@
+{% extends "base.html" %}
+{% block title %}Номенклатура{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+  <div class="d-flex align-items-center gap-2 flex-wrap">
+    <h3 class="mb-0">Номенклатура</h3>
+    {% if not current_user.is_fulfillment_only() %}    <a class="btn btn-sm btn-outline-primary" href="{{ url_for('nomenclature.locate') }}">📍 Где товар</a>{% endif %}
+    {% if current_user.can_edit_nomenclature() %}
+    <a class="btn btn-sm btn-outline-warning" href="{{ url_for('nomenclature.duplicates') }}">🧬 Дубли</a>
+    {% endif %}
+  </div>
+  <div class="d-none d-md-flex gap-2">
+    {% if current_user.can_edit_nomenclature() %}
+    <a class="btn btn-outline-secondary" href="{{ url_for('nomenclature.download_template') }}">📄 Скачать шаблон</a>
+    <a class="btn btn-outline-secondary" href="{{ url_for('nomenclature.import_nomenclature') }}">📥 Импорт из Excel</a>
+    {% endif %}
+    {% if not current_user.is_fulfillment_only() %}
+    <form method="get" action="{{ url_for('nomenclature.export_all') }}" class="d-flex gap-1">
+      <select name="warehouse_id" class="form-select form-select-sm" title="Остаток по складу">
+        <option value="">Остаток: все склады</option>
+        {% for wh in stock_warehouses %}
+        <option value="{{ wh.id }}">Остаток: {{ wh.name }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="btn btn-outline-secondary">📤 Экспорт в Excel</button>
+    </form>
+    {% endif %}
+    {% if current_user.is_admin %}
+    <form method="post" action="{{ url_for('nomenclature.clear_nomenclature') }}" class="d-inline" onsubmit="return confirm('Удалить всю номенклатуру, у которой нет остатков и документов? Товары, уже использованные в реальных данных, не тронет. Действие необратимо.');">
+      <button type="submit" class="btn btn-outline-danger">🗑 Очистить номенклатуру</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+{% if current_user.can_edit_nomenclature() %}
+<div class="mb-4">
+  <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-toggle="collapse" data-bs-target="#addNomenclatureForm">
+    ➕ Добавить товар вручную
+  </button>
+  <div class="collapse mt-2" id="addNomenclatureForm">
+    <div class="card p-3 border-warning">
+      <h5>Добавить товар вручную</h5>
+      <form method="post" action="{{ url_for('nomenclature.create_nomenclature') }}" class="row g-2 align-items-end">
+        <div class="col-6 col-md-2">
+          <label class="form-label">Штрихкод</label>
+          <input type="text" name="barcode" class="form-control" required>
+        </div>
+        <div class="col-6 col-md-2">
+          <label class="form-label">Доп. штрихкод <span class="text-muted">(необязательно)</span></label>
+          <input type="text" name="barcode2" class="form-control">
+        </div>
+        <div class="col-12 col-md-3">
+          <label class="form-label">Наименование</label>
+          <input type="text" name="name" class="form-control" required>
+        </div>
+        <div class="col-6 col-md-2">
+          <label class="form-label">Размер</label>
+          <input type="text" name="size" class="form-control">
+        </div>
+        <div class="col-6 col-md-1">
+          <label class="form-label">Ед. изм.</label>
+          <input type="text" name="unit" class="form-control" value="шт">
+        </div>
+        <div class="col-6 col-md-1">
+          <label class="form-label">Норма/шт, мин <span class="text-muted" title="Норма времени на 1 шт — для эффективности на производстве">ⓘ</span></label>
+          <input type="number" step="0.1" min="0" name="norm_minutes" class="form-control">
+        </div>
+        <div class="col-6 col-md-1">
+          <button type="submit" class="btn btn-primary w-100">Добавить</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<div class="row g-4">
+  <div class="col-12">
+    <div class="card p-3">
+      <form method="get" class="mb-3 d-flex gap-2">
+        <input type="text" name="q" class="form-control form-control-lg" value="{{ q }}" placeholder="Поиск: содержит артикул / наименование / штрихкод" autofocus>
+        <button type="submit" class="btn btn-primary">🔍 Найти</button>
+      </form>
+      <table class="table table-sm d-none d-md-table">
+        <thead>
+          <tr>
+            <th>Штрихкод</th><th>Доп. штрихкод</th><th>Наименование</th><th>Артикул</th>
+            <th>Ед.</th>
+            <th>Вид</th>
+            {% for wh in stock_warehouses %}<th>{{ wh.name }}</th>{% endfor %}
+            <th></th>
+            {% if current_user.is_admin %}<th></th>{% endif %}
+          </tr>
+        </thead>
+        <tbody>
+        {% for item in items %}
+          <tr>
+            {% if current_user.can_edit_nomenclature() %}
+            <td style="min-width:150px">
+              <form method="post" action="{{ url_for('nomenclature.update_barcode', item_id=item.id) }}" class="d-flex gap-1">
+                <input type="hidden" name="q" value="{{ q }}">
+                <input type="text" name="barcode" value="{{ item.barcode }}" class="form-control form-control-sm">
+                <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+              </form>
+            </td>
+            <td style="min-width:150px">
+              <form method="post" action="{{ url_for('nomenclature.update_barcode2', item_id=item.id) }}" class="d-flex gap-1">
+                <input type="hidden" name="q" value="{{ q }}">
+                <input type="text" name="barcode2" value="{{ item.barcode2 or '' }}" class="form-control form-control-sm">
+                <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+              </form>
+            </td>
+            <td style="min-width:300px">
+              <form method="post" action="{{ url_for('nomenclature.update_name', item_id=item.id) }}" class="d-flex gap-1">
+                <input type="hidden" name="q" value="{{ q }}">
+                <input type="text" name="name" value="{{ item.name }}" class="form-control form-control-sm">
+                <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+              </form>
+            </td>
+            <td style="min-width:150px">
+              <form method="post" action="{{ url_for('nomenclature.update_sku', item_id=item.id) }}" class="d-flex gap-1">
+                <input type="hidden" name="q" value="{{ q }}">
+                <input type="text" name="sku" value="{{ item.sku }}" class="form-control form-control-sm">
+                <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+              </form>
+            </td>
+            {% else %}
+            <td>{{ item.barcode }}</td>
+            <td>{{ item.barcode2 or '' }}</td>
+            <td>{{ item.name }}</td>
+            <td>{{ item.sku }}</td>
+            {% endif %}
+            <td>{{ item.unit }}</td>
+            {% if current_user.can_edit_nomenclature() %}
+            <td style="min-width:160px">
+              <form method="post" action="{{ url_for('nomenclature.update_category', item_id=item.id) }}" class="d-flex gap-1">
+                <input type="hidden" name="q" value="{{ q }}">
+                <select name="category_id" class="form-select form-select-sm" onchange="this.form.submit()">
+                  <option value="">—</option>
+                  {% for cat in categories %}
+                  <option value="{{ cat.id }}" {% if item.category_id == cat.id %}selected{% endif %}>{{ cat.name }}</option>
+                  {% endfor %}
+                </select>
+              </form>
+            </td>
+            {% else %}
+            <td>{{ item.category.name if item.category else '—' }}</td>
+            {% endif %}
+            {% for wh in stock_warehouses %}
+            {% set unplaced = unplaced_by_item_warehouse.get((item.id, wh.id), 0) %}
+            <td>{% if not current_user.is_fulfillment_only() %}<a href="{{ url_for('nomenclature.locate', barcode=item.barcode) }}">{% endif %}{{ '%g' % stock_by_item_warehouse.get((item.id, wh.id), 0) }} {{ item.unit }}{% if not current_user.is_fulfillment_only() %}</a>{% endif %}
+              {% if unplaced %}<div class="small text-muted" title="Принято, но не упаковано в короб">в т.ч. неразм. {{ '%g' % unplaced }}</div>{% endif %}</td>
+            {% endfor %}
+            <td>{% if not current_user.is_fulfillment_only() %}<a target="_blank" href="{{ url_for('labels.item_label', item_id=item.id) }}">🖨 Этикетка</a>{% endif %}</td>
+            {% if current_user.is_admin %}
+            <td>
+              <form method="post" action="{{ url_for('nomenclature.delete_nomenclature', item_id=item.id) }}"
+                    onsubmit="return confirm('Удалить этот товар? Действие необратимо.');">
+                <input type="hidden" name="q" value="{{ q }}">
+                <button type="submit" class="btn btn-sm btn-outline-danger">🗑</button>
+              </form>
+            </td>
+            {% endif %}
+          </tr>
+        {% else %}
+          <tr><td colspan="{{ (8 if current_user.is_admin else 7) + stock_warehouses|length }}" class="text-muted">Ничего не найдено</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+
+      <!-- Мобильный вид: каждая позиция карточкой (не таблицей) — иначе
+           инлайн-редакторы не помещаются на узком экране даже при переносе
+           текста, поле "Вид" в таблице требует фиксированной ширины. -->
+      <div class="list-group d-md-none">
+        {% for item in items %}
+          <div class="list-group-item py-2 px-2">
+            {% if current_user.can_edit_nomenclature() %}
+            <div class="d-flex justify-content-between align-items-start gap-2">
+              <div class="flex-grow-1">
+                <form method="post" action="{{ url_for('nomenclature.update_name', item_id=item.id) }}" class="d-flex gap-1 mb-1">
+                  <input type="hidden" name="q" value="{{ q }}">
+                  <input type="text" name="name" value="{{ item.name }}" class="form-control form-control-sm fw-bold">
+                  <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+                </form>
+                <form method="post" action="{{ url_for('nomenclature.update_barcode', item_id=item.id) }}" class="d-flex gap-1 align-items-center mb-1">
+                  <input type="hidden" name="q" value="{{ q }}">
+                  <input type="text" name="barcode" value="{{ item.barcode }}" class="form-control form-control-sm">
+                  <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+                </form>
+                <form method="post" action="{{ url_for('nomenclature.update_barcode2', item_id=item.id) }}" class="d-flex gap-1 align-items-center mb-1">
+                  <input type="hidden" name="q" value="{{ q }}">
+                  <input type="text" name="barcode2" value="{{ item.barcode2 or '' }}" class="form-control form-control-sm" placeholder="Доп. штрихкод">
+                  <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+                </form>
+                <form method="post" action="{{ url_for('nomenclature.update_sku', item_id=item.id) }}" class="d-flex gap-1 align-items-center">
+                  <input type="hidden" name="q" value="{{ q }}">
+                  <input type="text" name="sku" value="{{ item.sku }}" class="form-control form-control-sm" placeholder="Артикул">
+                  <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
+                </form>
+              </div>
+              {% if not current_user.is_fulfillment_only() %}<a target="_blank" href="{{ url_for('labels.item_label', item_id=item.id) }}" class="btn btn-sm btn-outline-secondary flex-shrink-0" title="Этикетка">🖨</a>{% endif %}
+            </div>
+            {% else %}
+            <div class="d-flex justify-content-between align-items-start gap-2">
+              <div>
+                <div class="fw-bold">{{ item.name }}</div>
+                <div class="small text-muted">{{ item.barcode }}{% if item.barcode2 %} / {{ item.barcode2 }}{% endif %} · арт. {{ item.sku }}</div>
+              </div>
+              {% if not current_user.is_fulfillment_only() %}<a target="_blank" href="{{ url_for('labels.item_label', item_id=item.id) }}" class="btn btn-sm btn-outline-secondary flex-shrink-0" title="Этикетка">🖨</a>{% endif %}
+            </div>
+            {% endif %}
+            {% if current_user.can_edit_nomenclature() %}
+            <div class="d-flex gap-2 mt-2">
+              <form method="post" action="{{ url_for('nomenclature.update_category', item_id=item.id) }}" class="flex-grow-1">
+                <input type="hidden" name="q" value="{{ q }}">
+                <select name="category_id" class="form-select form-select-sm" onchange="this.form.submit()">
+                  <option value="">Вид: —</option>
+                  {% for cat in categories %}
+                  <option value="{{ cat.id }}" {% if item.category_id == cat.id %}selected{% endif %}>{{ cat.name }}</option>
+                  {% endfor %}
+                </select>
+              </form>
+            </div>
+            {% else %}
+            <div class="small text-muted mt-1">Вид: {{ item.category.name if item.category else '—' }}</div>
+            {% endif %}
+            <div class="small mt-1">
+              {% for wh in stock_warehouses %}
+              {{ wh.name }}: {% if not current_user.is_fulfillment_only() %}<a href="{{ url_for('nomenclature.locate', barcode=item.barcode) }}">{% endif %}{{ '%g' % stock_by_item_warehouse.get((item.id, wh.id), 0) }} {{ item.unit }}{% if not current_user.is_fulfillment_only() %}</a>{% endif %}{% if unplaced_by_item_warehouse.get((item.id, wh.id)) %} <span class="text-muted">(неразм. {{ '%g' % unplaced_by_item_warehouse.get((item.id, wh.id)) }})</span>{% endif %}{% if not loop.last %} · {% endif %}
+              {% endfor %}
+            </div>
+            {% if current_user.is_admin %}
+            <form method="post" action="{{ url_for('nomenclature.delete_nomenclature', item_id=item.id) }}" class="mt-2"
+                  onsubmit="return confirm('Удалить этот товар? Действие необратимо.');">
+              <input type="hidden" name="q" value="{{ q }}">
+              <button type="submit" class="btn btn-sm btn-outline-danger">🗑 Удалить</button>
+            </form>
+            {% endif %}
+          </div>
+        {% else %}
+          <div class="list-group-item text-muted">Ничего не найдено</div>
+        {% endfor %}
+      </div>
+
+      {% if pagination.pages > 1 %}
+      <nav class="d-flex justify-content-between align-items-center mt-3">
+        <div class="text-muted small">Стр. {{ pagination.page }} из {{ pagination.pages }} · всего товаров: {{ pagination.total }}</div>
+        <div class="d-flex gap-2">
+          {% if pagination.has_prev %}
+            <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('nomenclature.list_nomenclature', q=q, page=pagination.prev_num) }}">&larr; Назад</a>
+          {% endif %}
+          {% if pagination.has_next %}
+            <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('nomenclature.list_nomenclature', q=q, page=pagination.next_num) }}">Вперед &rarr;</a>
+          {% endif %}
+        </div>
+      </nav>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

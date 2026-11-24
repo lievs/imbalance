@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Подбор коробов{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+  <div>
+    <h3 class="mb-0">Задания на подбор коробов</h3>
+    <div class="text-muted">Короба для подбора и их текущее размещение</div>
+  </div>
+  <a class="btn btn-primary" href="{{ url_for('box_picking.create_task') }}">+ Новое задание</a>
+</div>
+
+<div class="btn-group mb-3" role="group">
+  <a class="btn btn-sm {{ 'btn-primary' if status == 'open' else 'btn-outline-primary' }}" href="{{ url_for('box_picking.list_tasks', status='open') }}">Открытые</a>
+  <a class="btn btn-sm {{ 'btn-primary' if status == 'completed' else 'btn-outline-primary' }}" href="{{ url_for('box_picking.list_tasks', status='completed') }}">Выполненные</a>
+  <a class="btn btn-sm {{ 'btn-primary' if status == 'all' else 'btn-outline-primary' }}" href="{{ url_for('box_picking.list_tasks', status='all') }}">Все</a>
+</div>
+
+<div class="table-responsive">
+<table class="table table-hover align-middle">
+  <thead><tr><th>Номер</th><th>Задание</th><th>Склад</th><th>Исполнитель</th><th>Прогресс</th><th>Статус</th><th>Создано</th></tr></thead>
+  <tbody>
+  {% for task in tasks %}
+    <tr>
+      <td><a href="{{ url_for('box_picking.detail', task_id=task.id) }}" class="fw-semibold">{{ task.number }}</a></td>
+      <td>{{ task.title or 'Подбор коробов' }}</td>
+      <td>{{ task.warehouse.name }}</td>
+      <td>{{ task.assigned_to.display_name() if task.assigned_to else 'Не назначен' }}</td>
+      <td>{{ task.picked_count() }} / {{ task.total_count() }}</td>
+      <td><span class="badge {{ 'bg-success' if task.status == 'completed' else 'bg-primary' if task.status == 'in_progress' else 'bg-secondary' }}">{{ status_labels[task.status] }}</span></td>
+      <td>{{ task.created_at.strftime('%d.%m.%Y %H:%M') }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="7" class="text-center text-muted py-4">Заданий нет</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}
