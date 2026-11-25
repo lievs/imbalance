@@ -33,6 +33,24 @@ def test_search_requires_all_words_to_match(db, client_logged_in):
     assert resp.get_json() == []
 
 
+def test_search_result_shows_size_and_can_be_found_by_size(db, client_logged_in):
+    item = Nomenclature(
+        sku="SIZE-SKU",
+        barcode="2222222222",
+        name="Блузка Бохо муслиновая",
+        size="48",
+        unit="шт",
+    )
+    db.session.add(item)
+    db.session.commit()
+
+    rows = client_logged_in.get("/api/nomenclature/search?q=48").get_json()
+
+    assert len(rows) == 1
+    assert rows[0]["size"] == "48"
+    assert "размер 48" in rows[0]["label"]
+
+
 def test_search_empty_query_returns_empty_list(db, client_logged_in):
     _make_item()
 

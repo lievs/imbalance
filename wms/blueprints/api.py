@@ -24,6 +24,7 @@ def search_nomenclature():
             Nomenclature.sku.ilike(f"%{token}%"),
             Nomenclature.barcode.ilike(f"%{token}%"),
             Nomenclature.barcode2.ilike(f"%{token}%"),
+            Nomenclature.size.ilike(f"%{token}%"),
         )
         for token in tokens
     ]
@@ -40,8 +41,13 @@ def search_nomenclature():
                 "sku": i.sku,
                 "barcode": i.barcode,
                 "name": i.name,
+                "size": i.size or "",
                 "unit": i.unit,
-                "label": f"{i.name} (арт. {i.sku}, шк. {i.barcode})",
+                "label": (
+                    f"{i.name} — размер {i.size} (арт. {i.sku}, шк. {i.barcode})"
+                    if i.size
+                    else f"{i.name} (арт. {i.sku}, шк. {i.barcode})"
+                ),
             }
             for i in items
         ]
