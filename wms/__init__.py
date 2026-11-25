@@ -716,6 +716,34 @@ def _bootstrap_admin():
     print("=" * 60)
 
 
+def _seed_standalone_warehouses():
+    """Создает два физических склада новой компании при первом запуске.
+
+    Поиск идет и по постоянному коду, и по названию, поэтому повторные
+    запуски приложения не создают дубли, а уже заведенный вручную склад с
+    тем же названием остается исходной записью со всей своей историей.
+    """
+    from .models import Warehouse
+
+    defaults = (
+        ("WH-NAZIMIKHA", "Склад Назимиха"),
+        ("WH-SHCHELKOVO", "Склад Щелково"),
+    )
+    created = []
+    for code, name in defaults:
+        warehouse = Warehouse.query.filter(
+            (Warehouse.code == code) | (Warehouse.name == name)
+        ).first()
+        if warehouse:
+            warehouse.is_active = True
+            continue
+        db.session.add(Warehouse(code=code, name=name, is_active=True))
+        created.append(name)
+    db.session.commit()
+    if created:
+        print(f"[bootstrap] Созданы склады: {', '.join(created)}")
+
+
 # Эндпоинты вне приемки/перемещений, доступные роли "фулфилмент" (см. чат:
 # видят свой склад, печатают стикеры своих коробов, видят общую номенклатуру,
 # при приемке подтягивается вся номенклатура). Только чтение и печать; кто
@@ -842,6 +870,8 @@ def create_app(config_class=Config):
             if not app.config.get("TESTING"):
                 _seed_mvb_default_prices()
                 _seed_mvb_default_schedules()
+        if app.config.get("STANDALONE_COMPANY_MODE") and not app.config.get("TESTING"):
+            _seed_standalone_warehouses()
         _bootstrap_admin()
         bootstrap_categories()
 
@@ -980,6 +1010,7 @@ def create_app(config_class=Config):
             "marketplace_api_enabled": app.config.get("ENABLE_MARKETPLACE_API", False),
             "one_c_integration_enabled": app.config.get("ENABLE_1C_INTEGRATION", False),
             "mvb_logistics_enabled": app.config.get("ENABLE_MVB_LOGISTICS", False),
+            "counterparties_enabled": app.config.get("ENABLE_COUNTERPARTIES", False),
         }
 
     return app

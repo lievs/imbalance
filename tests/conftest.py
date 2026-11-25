@@ -16,6 +16,7 @@ from wms.models import User
 
 class TestConfig(Config):
     TESTING = True
+    ENABLE_COUNTERPARTIES = True
     SECRET_KEY = "test-secret-key"
     SQLALCHEMY_DATABASE_URI = "sqlite://"
     SQLALCHEMY_ENGINE_OPTIONS = {

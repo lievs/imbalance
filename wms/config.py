@@ -34,6 +34,7 @@ class Config:
     ENABLE_PRODUCTION = False
     ENABLE_EMPLOYEE_PERFORMANCE = False
     ENABLE_MVB_LOGISTICS = False
+    ENABLE_COUNTERPARTIES = False
 
     # Демо-режим для презентаций (см. run_demo.py и docs/DEMO.md): отдельная
     # база с вымышленными данными и заметный баннер в интерфейсе. Включается

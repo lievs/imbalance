@@ -336,6 +336,10 @@ def counterparties():
     используется при загрузке накладной и выгрузке возвратов в 1С. Поэтому
     исправление карточки по ИНН сразу видно и здесь, и в следующих обменах.
     """
+    if not current_app.config.get("ENABLE_COUNTERPARTIES", False):
+        flash("Справочник контрагентов в этой версии WMS отключен.", "info")
+        return redirect(url_for("receiving.list_documents"))
+
     q = request.args.get("q", "").strip()
     query = (
         db.session.query(
