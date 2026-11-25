@@ -613,6 +613,23 @@ def update_name(item_id):
     return redirect(url_for("nomenclature.list_nomenclature", q=q))
 
 
+@bp.route("/<int:item_id>/size", methods=["POST"])
+def update_size(item_id):
+    """Размер можно поправить прямо в списке номенклатуры. Пустое
+    значение снимает ранее указанный размер."""
+    if not _require_edit():
+        return redirect(url_for("nomenclature.list_nomenclature"))
+
+    item = Nomenclature.query.get_or_404(item_id)
+    size = request.form.get("size", "").strip()
+    q = request.form.get("q", "")
+
+    item.size = size or None
+    db.session.commit()
+    flash(f"Размер для «{item.name}» обновлен", "success")
+    return redirect(url_for("nomenclature.list_nomenclature", q=q))
+
+
 @bp.route("/<int:item_id>/delete", methods=["POST"])
 def delete_nomenclature(item_id):
     """Удаление одного товара — доступно только администратору. Как и

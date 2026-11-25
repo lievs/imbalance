@@ -231,6 +231,58 @@ def test_list_nomenclature_shows_sku_column(db, client_logged_in):
     assert f'value="{item.sku}"' in html
 
 
+def test_list_nomenclature_shows_editable_size_column(db, client_logged_in):
+    item = Nomenclature(
+        sku="SKU-EDIT-SIZE",
+        barcode="6667778889996",
+        name="Товар с размером",
+        size="XL",
+        unit="шт",
+    )
+    db.session.add(item)
+    db.session.commit()
+
+    html = client_logged_in.get("/nomenclature/").get_data(as_text=True)
+
+    assert "Размер" in html
+    assert f'action="/nomenclature/{item.id}/size"' in html
+    assert 'name="size" value="XL"' in html
+
+
+def test_update_size_allowed_with_permission(db, client_logged_in):
+    item = Nomenclature(
+        sku="SKU-EDIT-SIZE-2",
+        barcode="6667778889997",
+        name="Товар для размера",
+        size="M",
+        unit="шт",
+    )
+    db.session.add(item)
+    db.session.commit()
+
+    client_logged_in.post(f"/nomenclature/{item.id}/size", data={"size": " L "})
+
+    assert Nomenclature.query.get(item.id).size == "L"
+
+
+def test_update_size_blocked_without_permission(db, client):
+    item = Nomenclature(
+        sku="SKU-EDIT-SIZE-3",
+        barcode="6667778889998",
+        name="Товар без права правки размера",
+        size="S",
+        unit="шт",
+    )
+    db.session.add(item)
+    db.session.commit()
+    user = _make_staff_user(nomenclature_edit_allowed=False)
+    _login_as(client, user)
+
+    client.post(f"/nomenclature/{item.id}/size", data={"size": "XL"})
+
+    assert Nomenclature.query.get(item.id).size == "S"
+
+
 def test_update_sections_route_can_grant_and_revoke_edit_flag(db, client_logged_in):
     user = _make_staff_user(nomenclature_edit_allowed=False)
 
