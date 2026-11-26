@@ -2,7 +2,7 @@ from flask import Blueprint, Response, abort, flash, redirect, render_template, 
 from flask_login import current_user
 
 from ..extensions import db
-from ..models import Box, BoxCabinet, BoxItem, Nomenclature, Warehouse
+from ..models import Box, BoxCabinet, BoxItem, BoxPickingTask, Nomenclature, Warehouse
 from ..utils.excel_io import export_boxes_to_excel, timestamp_for_filename
 from ..utils.http import content_disposition
 from ..utils.numbering import next_box_number
@@ -59,6 +59,11 @@ def list_boxes():
         cabinets=BoxCabinet.query.order_by(BoxCabinet.prefix).all(),
         query_text=query_text,
         item_counts=item_counts,
+        open_picking_tasks=(
+            BoxPickingTask.query.filter(BoxPickingTask.status != "completed")
+            .order_by(BoxPickingTask.created_at.desc())
+            .all()
+        ),
     )
 
 

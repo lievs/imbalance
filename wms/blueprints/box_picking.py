@@ -38,14 +38,12 @@ def _add_codes(task, raw):
     errors = []
     existing_ids = {line.box_id for line in task.lines.all()}
     for code in _codes(raw):
-        box = Box.find_by_scanned_code(code)
+        # Цифровая часть номера может совпадать у коробов разных кабинетов.
+        # Ищем сразу внутри склада задания, иначе первым мог найтись короб
+        # другого склада и корректный короб ошибочно отклонялся.
+        box = Box.find_by_scanned_code(code, warehouse_id=task.warehouse_id)
         if box is None:
             errors.append(f"Короб {code} не найден")
-            continue
-        if box.warehouse_id != task.warehouse_id:
-            errors.append(
-                f"Короб {box.box_number} находится на складе «{box.warehouse.name}»"
-            )
             continue
         if box.id in existing_ids:
             continue
@@ -106,6 +104,67 @@ def create_task():
     return redirect(url_for("box_picking.detail", task_id=task.id))
 
 
+@bp.route("/add-selected-boxes", methods=["POST"])
+def add_selected_boxes():
+    """Добавляет отмеченные в общем списке короба в открытое задание.
+
+    Здесь передаются первичные ID коробов, поэтому массовое добавление не
+    зависит от неоднозначных цифровых штрихкодов разных кабинетов.
+    """
+    task_id = request.form.get("task_id", type=int)
+    task = db.session.get(BoxPickingTask, task_id) if task_id else None
+    if task is None:
+        flash("Выберите задание на подбор", "danger")
+        return redirect(url_for("boxes.list_boxes"))
+    if task.status == "completed":
+        flash("Выполненное задание сначала нужно открыть заново", "warning")
+        return redirect(url_for("box_picking.detail", task_id=task.id))
+
+    box_ids = []
+    for raw_id in request.form.getlist("ids"):
+        try:
+            box_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if box_id not in box_ids:
+            box_ids.append(box_id)
+
+    if not box_ids:
+        flash("Отметьте хотя бы один короб", "warning")
+        return redirect(url_for("boxes.list_boxes"))
+
+    boxes_by_id = {
+        box.id: box for box in Box.query.filter(Box.id.in_(box_ids)).all()
+    }
+    existing_ids = {line.box_id for line in task.lines.all()}
+    added = 0
+    wrong_warehouse = []
+    for box_id in box_ids:
+        box = boxes_by_id.get(box_id)
+        if box is None or box.id in existing_ids:
+            continue
+        if box.warehouse_id != task.warehouse_id:
+            wrong_warehouse.append(box.box_number)
+            continue
+        db.session.add(BoxPickingTaskLine(task=task, box=box))
+        existing_ids.add(box.id)
+        added += 1
+
+    db.session.commit()
+    if added:
+        flash(f"Добавлено коробов: {added}", "success")
+    elif not wrong_warehouse:
+        flash("Выбранные короба уже находятся в этом задании", "info")
+    if wrong_warehouse:
+        preview = ", ".join(wrong_warehouse[:10])
+        suffix = f" и ещё {len(wrong_warehouse) - 10}" if len(wrong_warehouse) > 10 else ""
+        flash(
+            f"Не добавлены короба с другого склада: {preview}{suffix}",
+            "warning",
+        )
+    return redirect(url_for("box_picking.detail", task_id=task.id))
+
+
 @bp.route("/<int:task_id>")
 def detail(task_id):
     task = BoxPickingTask.query.get_or_404(task_id)
@@ -149,7 +208,10 @@ def scan(task_id):
         return redirect(url_for("box_picking.detail", task_id=task.id))
 
     code = request.form.get("box_code", "").strip()
-    box = Box.find_by_scanned_code(code)
+    # Как и при наполнении задания, цифровой штрихкод разрешаем только на
+    # складе этого задания: одинаковая цифровая часть встречается у разных
+    # кабинетов и не должна уводить скан в чужой короб.
+    box = Box.find_by_scanned_code(code, warehouse_id=task.warehouse_id)
     line = (
         BoxPickingTaskLine.query.filter_by(task_id=task.id, box_id=box.id).first()
         if box

@@ -56,7 +56,24 @@
         <button type="button" class="btn btn-sm btn-outline-secondary" data-check-all="0">Снять выбор</button>
         <span class="text-muted small">показано {{ boxes|length }}{% if boxes|length == 500 %} (первые 500, уточните поиск){% endif %}</span>
       </div>
-      <button type="submit" class="btn btn-primary">🖨 Печать выбранных этикеток</button>
+      <div class="d-flex flex-wrap gap-2 align-items-center">
+        {% if open_picking_tasks and current_user.has_section_access('box_picking') %}
+        <select name="task_id" class="form-select form-select-sm" style="width:auto" aria-label="Задание на подбор">
+          <option value="">Выберите задание</option>
+          {% for task in open_picking_tasks %}
+          <option value="{{ task.id }}">{{ task.number }} · {{ task.warehouse.name }}{% if task.title %} · {{ task.title }}{% endif %}</option>
+          {% endfor %}
+        </select>
+        <button type="submit"
+                class="btn btn-sm btn-success"
+                formaction="{{ url_for('box_picking.add_selected_boxes') }}"
+                formmethod="post"
+                formtarget="_self">Добавить выбранные в задание</button>
+        {% elif current_user.has_section_access('box_picking') %}
+        <a class="btn btn-sm btn-outline-success" href="{{ url_for('box_picking.create_task') }}">Создать задание на подбор</a>
+        {% endif %}
+        <button type="submit" class="btn btn-primary">🖨 Печать выбранных этикеток</button>
+      </div>
     </div>
     <!-- Один чекбокс на короб (не дублируем под мобильную/десктопную
          версии — иначе оба экземпляра "checked" по умолчанию задвоят

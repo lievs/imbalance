@@ -1,6 +1,7 @@
 from wms.extensions import db
 from wms.models import (
     Box,
+    BoxCabinet,
     BoxPickingTask,
     BoxPickingTaskLine,
     Cell,
@@ -85,6 +86,72 @@ def test_scan_only_task_boxes_and_complete_task(client_logged_in, app):
         assert task.status == "completed"
         assert task.completed_at is not None
         assert task.picked_count() == 2
+
+
+def test_numeric_box_code_is_resolved_inside_task_warehouse(client_logged_in, app):
+    """Одинаковая цифровая часть возможна у разных кабинетов.
+
+    В задание должен попасть короб выбранного склада, а не первый найденный
+    короб с тем же цифровым штрихкодом.
+    """
+    with app.app_context():
+        first = Warehouse(code="PICK-FIRST", name="Первый склад")
+        target = Warehouse(code="PICK-TARGET", name="Нужный склад")
+        first_cabinet = BoxCabinet(name="Первый кабинет", prefix="PF")
+        target_cabinet = BoxCabinet(name="Нужный кабинет", prefix="PT")
+        db.session.add_all([first, target, first_cabinet, target_cabinet])
+        db.session.flush()
+        db.session.add_all([
+            Box(box_number="PF-000777", warehouse=first, cabinet=first_cabinet),
+            Box(box_number="PT-000777", warehouse=target, cabinet=target_cabinet),
+        ])
+        db.session.commit()
+        target_id = target.id
+
+    response = client_logged_in.post(
+        "/box-picking/create",
+        data={"warehouse_id": target_id, "box_codes": "000777"},
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert "PT-000777" in response.get_data(as_text=True)
+    with app.app_context():
+        task = BoxPickingTask.query.one()
+        assert [line.box.box_number for line in task.lines.all()] == ["PT-000777"]
+
+
+def test_add_selected_boxes_from_box_list(client_logged_in, app):
+    with app.app_context():
+        warehouse, boxes = _warehouse_with_boxes()
+        other_warehouse = Warehouse(code="PICK-OTHER", name="Другой склад")
+        db.session.add(other_warehouse)
+        db.session.flush()
+        other_box = Box(box_number="BOX-899999", warehouse=other_warehouse)
+        task = BoxPickingTask(number="POD-900002", warehouse=warehouse)
+        db.session.add_all([other_box, task])
+        db.session.commit()
+        task_id = task.id
+        selected_ids = [str(box.id) for box in boxes] + [str(other_box.id)]
+
+    list_html = client_logged_in.get("/boxes/").get_data(as_text=True)
+    assert "Добавить выбранные в задание" in list_html
+    assert "POD-900002" in list_html
+
+    response = client_logged_in.post(
+        "/box-picking/add-selected-boxes",
+        data={"task_id": task_id, "ids": selected_ids},
+        follow_redirects=True,
+    )
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "Добавлено коробов: 2" in html
+    assert "Не добавлены короба с другого склада" in html
+    with app.app_context():
+        task = db.session.get(BoxPickingTask, task_id)
+        assert {line.box.box_number for line in task.lines.all()} == {
+            "BOX-800001",
+            "BOX-800002",
+        }
 
 
 def test_removed_modules_are_not_registered_and_not_in_menu(client_logged_in, app):
