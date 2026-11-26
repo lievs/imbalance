@@ -87,7 +87,6 @@
           <tr>
             <th>Штрихкод</th><th>Доп. штрихкод</th><th>Наименование</th><th>Размер</th><th>Артикул</th>
             <th>Ед.</th>
-            <th>Вид</th>
             {% for wh in stock_warehouses %}<th>{{ wh.name }}</th>{% endfor %}
             <th></th>
             {% if current_user.is_admin %}<th></th>{% endif %}
@@ -140,21 +139,6 @@
             <td>{{ item.sku }}</td>
             {% endif %}
             <td>{{ item.unit }}</td>
-            {% if current_user.can_edit_nomenclature() %}
-            <td style="min-width:160px">
-              <form method="post" action="{{ url_for('nomenclature.update_category', item_id=item.id) }}" class="d-flex gap-1">
-                <input type="hidden" name="q" value="{{ q }}">
-                <select name="category_id" class="form-select form-select-sm" onchange="this.form.submit()">
-                  <option value="">—</option>
-                  {% for cat in categories %}
-                  <option value="{{ cat.id }}" {% if item.category_id == cat.id %}selected{% endif %}>{{ cat.name }}</option>
-                  {% endfor %}
-                </select>
-              </form>
-            </td>
-            {% else %}
-            <td>{{ item.category.name if item.category else '—' }}</td>
-            {% endif %}
             {% for wh in stock_warehouses %}
             {% set unplaced = unplaced_by_item_warehouse.get((item.id, wh.id), 0) %}
             <td>{% if not current_user.is_fulfillment_only() %}<a href="{{ url_for('nomenclature.locate', barcode=item.barcode) }}">{% endif %}{{ '%g' % stock_by_item_warehouse.get((item.id, wh.id), 0) }} {{ item.unit }}{% if not current_user.is_fulfillment_only() %}</a>{% endif %}
@@ -172,14 +156,13 @@
             {% endif %}
           </tr>
         {% else %}
-          <tr><td colspan="{{ (9 if current_user.is_admin else 8) + stock_warehouses|length }}" class="text-muted">Ничего не найдено</td></tr>
+          <tr><td colspan="{{ (8 if current_user.is_admin else 7) + stock_warehouses|length }}" class="text-muted">Ничего не найдено</td></tr>
         {% endfor %}
         </tbody>
       </table>
 
       <!-- Мобильный вид: каждая позиция карточкой (не таблицей) — иначе
-           инлайн-редакторы не помещаются на узком экране даже при переносе
-           текста, поле "Вид" в таблице требует фиксированной ширины. -->
+           инлайн-редакторы не помещаются на узком экране. -->
       <div class="list-group d-md-none">
         {% for item in items %}
           <div class="list-group-item py-2 px-2">
@@ -222,21 +205,6 @@
               </div>
               {% if not current_user.is_fulfillment_only() %}<a target="_blank" href="{{ url_for('labels.item_label', item_id=item.id) }}" class="btn btn-sm btn-outline-secondary flex-shrink-0" title="Этикетка">🖨</a>{% endif %}
             </div>
-            {% endif %}
-            {% if current_user.can_edit_nomenclature() %}
-            <div class="d-flex gap-2 mt-2">
-              <form method="post" action="{{ url_for('nomenclature.update_category', item_id=item.id) }}" class="flex-grow-1">
-                <input type="hidden" name="q" value="{{ q }}">
-                <select name="category_id" class="form-select form-select-sm" onchange="this.form.submit()">
-                  <option value="">Вид: —</option>
-                  {% for cat in categories %}
-                  <option value="{{ cat.id }}" {% if item.category_id == cat.id %}selected{% endif %}>{{ cat.name }}</option>
-                  {% endfor %}
-                </select>
-              </form>
-            </div>
-            {% else %}
-            <div class="small text-muted mt-1">Вид: {{ item.category.name if item.category else '—' }}</div>
             {% endif %}
             <div class="small mt-1">
               {% for wh in stock_warehouses %}
