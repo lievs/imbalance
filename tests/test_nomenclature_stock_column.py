@@ -81,3 +81,26 @@ def test_stock_on_non_physical_warehouse_is_not_shown(db, client_logged_in):
 
     assert idx != -1
     assert "99 шт" not in html[idx : idx + 3000]
+
+
+def test_imbalance_warehouses_have_separate_stock_columns(db, client_logged_in):
+    nazimikha = Warehouse(code="WH-NAZIMIKHA", name="Склад Назимиха")
+    shchelkovo = Warehouse(code="WH-SHCHELKOVO", name="Склад Щелково")
+    db.session.add_all([nazimikha, shchelkovo])
+    db.session.commit()
+    item = _make_item("5", name="Товар двух складов")
+    db.session.add_all(
+        [
+            UnplacedStock(warehouse_id=nazimikha.id, nomenclature_id=item.id, qty=7),
+            UnplacedStock(warehouse_id=shchelkovo.id, nomenclature_id=item.id, qty=11),
+        ]
+    )
+    db.session.commit()
+
+    html = client_logged_in.get("/nomenclature/").get_data(as_text=True)
+    item_row = html[html.find("Товар двух складов") :]
+
+    assert "<th>Склад Назимиха</th>" in html
+    assert "<th>Склад Щелково</th>" in html
+    assert "7 шт" in item_row[:3000]
+    assert "11 шт" in item_row[:3000]
