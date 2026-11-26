@@ -690,8 +690,9 @@ def detail(doc_id):
     doc = ReceivingDocument.query.get_or_404(doc_id)
     lines = doc.lines.all()
 
-    # "Активный" короб — как и в Размещении: выбирается сканированием/
-    # созданием и хранится в адресе страницы (?box=ID), чтобы дальше
+    # "Активный" короб — как и в Размещении: выбирается сканированием
+    # ранее созданного короба и хранится в адресе страницы (?box=ID),
+    # чтобы дальше
     # сканировать в него товар штрихкод за штрихкодом. Пока короб не выбран,
     # приемка работает как раньше — просто по количеству, в неразмещенный
     # остаток.
@@ -705,16 +706,12 @@ def detail(doc_id):
         Box.query.filter(Box.id.in_(packed_box_ids)).all() if packed_box_ids else []
     )
 
-    warehouses = _receiving_warehouses()
-
     return render_template(
         "receiving/detail.html",
         doc=doc,
         lines=lines,
         active_box=active_box,
         packed_boxes=packed_boxes,
-        warehouses=warehouses,
-        box_cabinets=BoxCabinet.query.filter_by(is_active=True).order_by(BoxCabinet.prefix).all(),
         add_request_token=secrets.token_urlsafe(24),
     )
 

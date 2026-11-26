@@ -27,19 +27,7 @@
       {% endif %}
     </h3>
     <div class="text-muted d-flex align-items-center flex-wrap gap-1">
-      Склад:
-      {% if doc.status != 'completed' and not packed_boxes %}
-        <form method="post" action="{{ url_for('receiving.change_warehouse', doc_id=doc.id) }}" class="d-inline-flex gap-1 align-items-center">
-          <select name="warehouse_id" class="form-select form-select-sm d-inline-block" style="width:auto">
-            {% for wh in warehouses %}
-              <option value="{{ wh.id }}" {% if wh.id == doc.warehouse_id %}selected{% endif %}>{{ wh.name }}</option>
-            {% endfor %}
-          </select>
-          <button type="submit" class="btn btn-sm btn-outline-secondary">✓</button>
-        </form>
-      {% else %}
-        {{ doc.warehouse.name }}
-      {% endif %}
+      Склад: {{ doc.warehouse.name }}
       {% if doc.supplier %}· Поставщик: {{ doc.supplier }}{% endif %}{% if doc.order_number %} · № заказа: {{ doc.order_number }}{% endif %}{% if doc.created_by %} · Автор: {{ doc.created_by.display_name() }}{% endif %}{% if doc.invoice_file_data %} · <a href="{{ url_for('receiving.download_invoice_file', doc_id=doc.id) }}">📄 Накладная</a>{% endif %}
     </div>
   </div>
@@ -106,7 +94,7 @@
 
 {% if doc.status == 'draft' %}
 <div class="card p-3 mb-4">
-  {% set hint_box = "Отсканируйте короб (уже созданный ранее массовой печатью) или создайте новый — товар будете сканировать сразу в него, минуя неразмещенный остаток. После скана короба фокус сам перейдет в поле поиска товара; после добавления товара вручную короб сбросится и можно сразу сканировать следующий — чтобы вернуться и добавить что-то еще в этот же короб, просто отсканируйте его снова." %}
+  {% set hint_box = "Отсканируйте уже созданный короб этого склада — товар будете сканировать сразу в него, минуя неразмещенный остаток. После скана короба фокус сам перейдет в поле поиска товара; после добавления товара вручную короб сбросится и можно сразу сканировать следующий — чтобы вернуться и добавить что-то еще в этот же короб, просто отсканируйте его снова." %}
   <h5 class="d-flex align-items-center gap-2">
     Короб <span class="text-muted small d-none d-md-inline">(по желанию — если сразу клеите короба и упаковываете товар по факту приемки)</span>
     <button type="button" class="hint-icon d-md-none" data-bs-toggle="popover" data-bs-trigger="focus"
@@ -123,20 +111,11 @@
     </div>
   {% else %}
     <p class="text-muted small d-none d-md-block">{{ hint_box }}</p>
-    <div class="d-flex gap-2 flex-wrap">
-      <form method="post" action="{{ url_for('receiving.select_box', doc_id=doc.id) }}" class="d-flex gap-2">
-        <input type="text" name="box_number" id="boxNumberInput" class="form-control form-control-lg" placeholder="Отсканируйте или введите номер короба" required autofocus>
-        <button type="button" class="btn btn-outline-primary" data-camera-scan-target="#boxNumberInput" title="Сканировать камерой">📷</button>
-        <button type="submit" class="btn btn-primary">Выбрать</button>
-      </form>
-      <form method="post" action="{{ url_for('receiving.create_box', doc_id=doc.id) }}" class="d-flex gap-2">
-        <select name="cabinet_id" class="form-select" required>
-          <option value="">Кабинет...</option>
-          {% for cabinet in box_cabinets %}<option value="{{ cabinet.id }}">{{ cabinet.prefix }} — {{ cabinet.name }}</option>{% endfor %}
-        </select>
-        <button type="submit" class="btn btn-outline-primary">📦 Создать новый короб</button>
-      </form>
-    </div>
+    <form method="post" action="{{ url_for('receiving.select_box', doc_id=doc.id) }}" class="d-flex gap-2">
+      <input type="text" name="box_number" id="boxNumberInput" class="form-control form-control-lg" placeholder="Отсканируйте или введите номер существующего короба" required autofocus>
+      <button type="button" class="btn btn-outline-primary" data-camera-scan-target="#boxNumberInput" title="Сканировать камерой">📷</button>
+      <button type="submit" class="btn btn-primary">Выбрать</button>
+    </form>
   {% endif %}
 </div>
 
