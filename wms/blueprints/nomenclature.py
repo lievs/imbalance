@@ -5,6 +5,7 @@ from ..extensions import db
 from ..models import (
     Box,
     BoxItem,
+    BoxPickingTask,
     InventoryLine,
     MovementReceiptDiscrepancy,
     Nomenclature,
@@ -284,6 +285,11 @@ def locate():
         item=item,
         box_rows=box_rows,
         unplaced_rows=unplaced_rows,
+        open_picking_tasks=(
+            BoxPickingTask.query.filter(BoxPickingTask.status != "completed")
+            .order_by(BoxPickingTask.created_at.desc())
+            .all()
+        ),
         not_found=not_found,
     )
 

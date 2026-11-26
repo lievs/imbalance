@@ -3,7 +3,16 @@
 возможности завести ячейки)."""
 
 from wms.extensions import db
-from wms.models import Box, BoxItem, Cell, Nomenclature, Warehouse, Zone
+from wms.models import (
+    Box,
+    BoxItem,
+    BoxPickingTask,
+    BoxPickingTaskLine,
+    Cell,
+    Nomenclature,
+    Warehouse,
+    Zone,
+)
 
 
 def _make_warehouse(code):
@@ -122,3 +131,45 @@ def test_box_warehouse_arrived_at_updates_on_movement_completion(db, client_logg
     db.session.refresh(box)
     assert box.warehouse_id == dest.id
     assert box.warehouse_arrived_at > old_arrived
+
+
+def test_locate_can_add_boxes_to_picking_or_create_new_task(db, client_logged_in, app):
+    warehouse = _make_warehouse("WH-LOCATE-PICK")
+    item = _make_item("8880000999")
+    boxes = [
+        Box(box_number="BOX-LOC-PICK-1", warehouse_id=warehouse.id),
+        Box(box_number="BOX-LOC-PICK-2", warehouse_id=warehouse.id),
+    ]
+    existing_task = BoxPickingTask(number="POD-LOC-1", warehouse_id=warehouse.id)
+    db.session.add_all(boxes + [existing_task])
+    db.session.flush()
+    db.session.add_all([
+        BoxItem(box_id=box.id, nomenclature_id=item.id, qty=index + 1)
+        for index, box in enumerate(boxes)
+    ])
+    db.session.commit()
+
+    html = client_logged_in.get(
+        f"/nomenclature/locate?barcode={item.barcode}"
+    ).get_data(as_text=True)
+    assert 'name="ids"' in html
+    assert "POD-LOC-1" in html
+    assert "Добавить в задание" in html
+    assert "Создать новое задание" in html
+
+    response = client_logged_in.post(
+        "/box-picking/create-from-selected-boxes",
+        data={
+            "ids": [str(box.id) for box in boxes],
+            "title": "Подбор: Товар для поиска",
+            "return_to": f"/nomenclature/locate?barcode={item.barcode}",
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert "Подбор: Товар для поиска" in response.get_data(as_text=True)
+    with app.app_context():
+        task = BoxPickingTask.query.filter(BoxPickingTask.number != "POD-LOC-1").one()
+        assert task.warehouse_id == warehouse.id
+        assert {line.box_id for line in task.lines.all()} == {box.id for box in boxes}
+        assert BoxPickingTaskLine.query.filter_by(task_id=task.id).count() == 2

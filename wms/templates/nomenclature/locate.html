@@ -24,11 +24,33 @@
   <div class="col-md-6">
     <div class="card p-3">
       <h5>В коробах</h5>
+      {% if box_rows and current_user.has_section_access('box_picking') %}
+      <form method="post" id="locatePickingForm">
+        <input type="hidden" name="return_to" value="{{ url_for('nomenclature.locate', barcode=barcode) }}">
+        <input type="hidden" name="title" value="Подбор: {{ item.name }}{% if item.size %} ({{ item.size }}){% endif %}">
+        <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-locate-check-all="1">Выбрать все</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-locate-check-all="0">Снять выбор</button>
+          {% if open_picking_tasks %}
+          <select name="task_id" class="form-select form-select-sm" style="width:auto">
+            <option value="">Выберите задание</option>
+            {% for task in open_picking_tasks %}
+            <option value="{{ task.id }}">{{ task.number }} · {{ task.warehouse.name }}{% if task.title %} · {{ task.title }}{% endif %}</option>
+            {% endfor %}
+          </select>
+          <button type="submit" class="btn btn-sm btn-success"
+                  formaction="{{ url_for('box_picking.add_selected_boxes') }}">Добавить в задание</button>
+          {% endif %}
+          <button type="submit" class="btn btn-sm btn-outline-success"
+                  formaction="{{ url_for('box_picking.create_from_selected_boxes') }}">Создать новое задание</button>
+        </div>
+      {% endif %}
       <table class="table table-sm table-mobile-compact">
-        <thead><tr><th>Склад</th><th>Ячейка/Ряд</th><th>Короб</th><th>Кол-во</th><th>На складе с</th></tr></thead>
+        <thead><tr>{% if box_rows and current_user.has_section_access('box_picking') %}<th></th>{% endif %}<th>Склад</th><th>Ячейка/Ряд</th><th>Короб</th><th>Кол-во</th><th>На складе с</th></tr></thead>
         <tbody>
         {% for bi in box_rows %}
           <tr>
+            {% if current_user.has_section_access('box_picking') %}<td><input type="checkbox" name="ids" value="{{ bi.box.id }}" form="locatePickingForm" class="form-check-input"></td>{% endif %}
             <td>{{ bi.box.warehouse.name }}</td>
             <td>
               {% if bi.box.cell %}{{ bi.box.cell.code }}
@@ -40,10 +62,11 @@
             <td class="text-nowrap">{{ (bi.box.warehouse_arrived_at | msk).strftime('%d.%m.%Y') if bi.box.warehouse_arrived_at else '—' }}</td>
           </tr>
         {% else %}
-          <tr><td colspan="5" class="text-muted">Товар ни в одном коробе не упакован</td></tr>
+          <tr><td colspan="6" class="text-muted">Товар ни в одном коробе не упакован</td></tr>
         {% endfor %}
         </tbody>
       </table>
+      {% if box_rows and current_user.has_section_access('box_picking') %}</form>{% endif %}
     </div>
   </div>
 
@@ -88,4 +111,17 @@
   </div>
 </div>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll("[data-locate-check-all]").forEach(function (button) {
+  button.addEventListener("click", function () {
+    var checked = button.dataset.locateCheckAll === "1";
+    document.querySelectorAll('#locatePickingForm input[name="ids"]').forEach(function (box) {
+      box.checked = checked;
+    });
+  });
+});
+</script>
 {% endblock %}

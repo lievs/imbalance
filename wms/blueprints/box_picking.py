@@ -122,6 +122,25 @@ def create_task():
     return redirect(url_for("box_picking.detail", task_id=task.id))
 
 
+def _selected_boxes_return_url():
+    return_to = request.form.get("return_to", "").strip()
+    if return_to.startswith("/") and not return_to.startswith("//"):
+        return return_to
+    return url_for("boxes.list_boxes")
+
+
+def _selected_box_ids():
+    box_ids = []
+    for raw_id in request.form.getlist("ids"):
+        try:
+            box_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if box_id not in box_ids:
+            box_ids.append(box_id)
+    return box_ids
+
+
 @bp.route("/add-selected-boxes", methods=["POST"])
 def add_selected_boxes():
     """Добавляет отмеченные в общем списке короба в открытое задание.
@@ -133,23 +152,15 @@ def add_selected_boxes():
     task = db.session.get(BoxPickingTask, task_id) if task_id else None
     if task is None:
         flash("Выберите задание на подбор", "danger")
-        return redirect(url_for("boxes.list_boxes"))
+        return redirect(_selected_boxes_return_url())
     if task.status == "completed":
         flash("Выполненное задание сначала нужно открыть заново", "warning")
         return redirect(url_for("box_picking.detail", task_id=task.id))
 
-    box_ids = []
-    for raw_id in request.form.getlist("ids"):
-        try:
-            box_id = int(raw_id)
-        except (TypeError, ValueError):
-            continue
-        if box_id not in box_ids:
-            box_ids.append(box_id)
-
+    box_ids = _selected_box_ids()
     if not box_ids:
         flash("Отметьте хотя бы один короб", "warning")
-        return redirect(url_for("boxes.list_boxes"))
+        return redirect(_selected_boxes_return_url())
 
     boxes_by_id = {
         box.id: box for box in Box.query.filter(Box.id.in_(box_ids)).all()
@@ -180,6 +191,46 @@ def add_selected_boxes():
             f"Не добавлены короба с другого склада: {preview}{suffix}",
             "warning",
         )
+    return redirect(url_for("box_picking.detail", task_id=task.id))
+
+
+@bp.route("/create-from-selected-boxes", methods=["POST"])
+def create_from_selected_boxes():
+    box_ids = _selected_box_ids()
+    if not box_ids:
+        flash("Отметьте хотя бы один короб", "warning")
+        return redirect(_selected_boxes_return_url())
+
+    boxes_by_id = {
+        box.id: box for box in Box.query.filter(Box.id.in_(box_ids)).all()
+    }
+    boxes = [boxes_by_id[box_id] for box_id in box_ids if box_id in boxes_by_id]
+    if not boxes:
+        flash("Выбранные короба не найдены", "danger")
+        return redirect(_selected_boxes_return_url())
+
+    warehouse_ids = {box.warehouse_id for box in boxes}
+    if len(warehouse_ids) != 1:
+        flash("Для нового задания выберите короба только одного склада", "danger")
+        return redirect(_selected_boxes_return_url())
+
+    title = request.form.get("title", "").strip()[:200] or "Подбор выбранных коробов"
+    task = BoxPickingTask(
+        number=next_number("box_picking"),
+        title=title,
+        warehouse_id=boxes[0].warehouse_id,
+        created_by=current_user,
+    )
+    db.session.add(task)
+    db.session.flush()
+    db.session.add_all([
+        BoxPickingTaskLine(task=task, box=box) for box in boxes
+    ])
+    db.session.commit()
+    flash(
+        f"Создано задание {task.number}, добавлено коробов: {len(boxes)}",
+        "success",
+    )
     return redirect(url_for("box_picking.detail", task_id=task.id))
 
 
