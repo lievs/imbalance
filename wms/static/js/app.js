@@ -220,7 +220,11 @@ document.addEventListener("DOMContentLoaded", () => {
       if (e.key === "Enter") {
         e.preventDefault();
         if (input.value.trim() && input.form) {
-          input.form.submit();
+          // requestSubmit вызывает обычное событие submit: защита от
+          // двойной отправки и обработчики конкретной формы успевают
+          // отменить таймер автосканирования. form.submit() их обходил.
+          if (typeof input.form.requestSubmit === "function") input.form.requestSubmit();
+          else input.form.submit();
         }
       }
     });

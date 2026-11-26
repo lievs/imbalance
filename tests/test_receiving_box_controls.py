@@ -25,6 +25,7 @@ def test_receiving_uses_fixed_warehouse_and_existing_boxes_only(
 
     assert "Отсканируйте или введите номер существующего короба" in html
     assert f"/receiving/{doc_id}/boxes/select" in html
+    assert 'data-camera-scan-target="#boxNumberInput"' in html
     assert "Создать новый короб" not in html
     assert 'name="cabinet_id"' not in html
     assert f"/receiving/{doc_id}/boxes/create" not in html

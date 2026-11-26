@@ -55,30 +55,25 @@ function _releaseCameraTracks() {
   });
 }
 
-function _stopCameraScan() {
+async function _stopCameraScan() {
   const inst = _cameraScanInstance;
   const starting = _cameraScanStarting;
   _cameraScanInstance = null;
   _cameraScanStarting = null;
-  const finish = () => {
+  const finish = async () => {
     _releaseCameraTracks();
     if (!inst) return;
-    let stopped;
     try {
-      stopped = inst.stop();
+      await inst.stop();
     } catch (e) {
-      stopped = Promise.resolve();
+      /* камера могла еще не перейти в запущенное состояние */
     }
-    Promise.resolve(stopped)
-      .catch(() => {})
-      .then(() => {
-        try {
-          inst.clear();
-        } catch (e) {
-          /* уже очищено */
-        }
-        _releaseCameraTracks();
-      });
+    try {
+      inst.clear();
+    } catch (e) {
+      /* уже очищено */
+    }
+    _releaseCameraTracks();
   };
   // Если камера еще запускается — дожидаемся результата запуска (успех или
   // ошибка) и только потом останавливаем, иначе stop() падает, а камера
@@ -86,13 +81,12 @@ function _stopCameraScan() {
   // Но не вечно: если запуск «завис» и не отвечает, через 1,5 с гасим
   // потоки принудительно и идем дальше.
   if (starting) {
-    Promise.race([
+    await Promise.race([
       starting.then(() => {}, () => {}),
       new Promise((resolve) => setTimeout(resolve, 1500)),
-    ]).then(finish);
-  } else {
-    finish();
+    ]);
   }
+  await finish();
 }
 
 function isCameraScanSupported() {
@@ -113,6 +107,26 @@ function _setCameraStatus(html, withRetry) {
     btn.addEventListener("click", () => _startCameraAttempt(0, true));
     statusEl.appendChild(btn);
   }
+}
+
+function _cameraErrorMessage(err) {
+  const message = String((err && (err.message || err.name)) || err || "");
+  if (/NotAllowed|Permission|denied|permission dismissed/i.test(message)) {
+    return (
+      "Доступ к камере запрещён. Разрешите камеру в настройках сайта " +
+      "(значок замка рядом с адресом), затем нажмите «Повторить»."
+    );
+  }
+  if (/NotFound|DevicesNotFound|no camera/i.test(message)) {
+    return "Камера на устройстве не найдена.";
+  }
+  if (/NotReadable|TrackStart|Could not start|in use|занят/i.test(message)) {
+    return (
+      "Камера занята другим приложением или прошлым запуском. Закройте другое " +
+      "приложение с камерой и нажмите «Повторить»."
+    );
+  }
+  return "Не удалось открыть камеру" + (message ? ": " + message : ".");
 }
 
 // Попытки запуска: 1) задняя камера, 2) первая камера из списка (на части
@@ -139,10 +153,8 @@ async function _startCameraAttempt(attempt, fresh) {
   _clearCameraTimer();
   if (fresh) {
     // полностью сбрасываем прошлую (возможно зависшую) попытку
-    await new Promise((resolve) => {
-      _stopCameraScan();
-      setTimeout(resolve, 150);
-    });
+    await _stopCameraScan();
+    await new Promise((resolve) => setTimeout(resolve, 150));
   }
   const statusEl = document.getElementById("cameraScanStatus");
   _setCameraStatus(attempt ? "Запуск камеры (попытка " + (attempt + 1) + ")..." : "Запуск камеры...");
@@ -163,9 +175,10 @@ async function _startCameraAttempt(attempt, fresh) {
       const done = _cameraScanOnResult;
       _cameraScanSession += 1;
       _clearCameraTimer();
-      _stopCameraScan();
-      _getCameraScanModal().hide();
-      if (done) done(decodedText);
+      _stopCameraScan().finally(() => {
+        _getCameraScanModal().hide();
+        if (done) done(decodedText);
+      });
     },
     () => {
       /* не удалось распознать текущий кадр — это нормально, продолжаем сканировать */
@@ -175,10 +188,10 @@ async function _startCameraAttempt(attempt, fresh) {
 
   // Запуск «завис»: ни ответа, ни ошибки — пробуем другой способ, а после
   // трех попыток подсказываем, что проверить.
-  _cameraScanTimer = setTimeout(() => {
+  _cameraScanTimer = setTimeout(async () => {
     if (session !== _cameraScanSession) return;
     _cameraScanSession += 1;
-    _stopCameraScan();
+    await _stopCameraScan();
     if (attempt < 2) {
       setTimeout(() => _startCameraAttempt(attempt + 1, false), 200);
     } else {
@@ -199,12 +212,13 @@ async function _startCameraAttempt(attempt, fresh) {
     .catch((err) => {
       if (session !== _cameraScanSession) return;
       _clearCameraTimer();
-      _stopCameraScan();
-      if (attempt < 2 && !/Permission|NotAllowed/i.test(String(err))) {
-        setTimeout(() => _startCameraAttempt(attempt + 1, false), 200);
-      } else {
-        _setCameraStatus("Не удалось открыть камеру: " + err, true);
-      }
+      _stopCameraScan().then(() => {
+        if (attempt < 2 && !/Permission|NotAllowed/i.test(String(err))) {
+          setTimeout(() => _startCameraAttempt(attempt + 1, false), 200);
+        } else {
+          _setCameraStatus(_cameraErrorMessage(err), true);
+        }
+      });
     });
 }
 
@@ -249,6 +263,9 @@ document.addEventListener("DOMContentLoaded", () => {
       openCameraScan((text) => {
         target.value = text;
         target.focus();
+        // Программное присваивание value само не вызывает input. Событие
+        // нужно полям с автопоиском и автоподтверждением скана.
+        target.dispatchEvent(new Event("input", { bubbles: true }));
         target.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
         target.dispatchEvent(new Event("change", { bubbles: true }));
       });

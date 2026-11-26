@@ -53,6 +53,8 @@ def test_create_task_shows_current_box_locations(client_logged_in, app):
     assert "ячейке A001" in html
     assert "ряду A" in html
     assert 'data-auto-submit' in html
+    assert 'data-camera-scan-target="#boxScan"' in html
+    assert "data-submit-on-enter" in html
     assert 'setTimeout(submitScan, 250)' in html
 
     with app.app_context():

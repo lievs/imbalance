@@ -15,7 +15,10 @@
   <form id="boxPickingScanForm" method="post" action="{{ url_for('box_picking.scan', task_id=task.id) }}" class="row g-2 align-items-end">
     <div class="col-md-8">
       <label class="form-label fw-semibold">Сканировать подобранный короб</label>
-      <input id="boxScan" name="box_code" class="form-control form-control-lg" autocomplete="off" autofocus required data-auto-submit placeholder="Штрихкод короба">
+      <div class="input-group">
+        <input id="boxScan" name="box_code" class="form-control form-control-lg" autocomplete="off" autofocus required data-auto-submit data-submit-on-enter placeholder="Штрихкод короба">
+        <button type="button" class="btn btn-outline-primary" data-camera-scan-target="#boxScan" title="Сканировать камерой">📷</button>
+      </div>
     </div>
     <div class="col-md-4"><button class="btn btn-success btn-lg w-100">✓ Подобран</button></div>
   </form>
