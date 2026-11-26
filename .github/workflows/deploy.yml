@@ -1,0 +1,98 @@
+name: Check and deploy WMS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-wms
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Standalone checks
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run enabled-feature tests
+        run: >
+          python -m pytest -q
+          tests/test_box_cabinets.py
+          tests/test_nomenclature_stock_column.py
+          tests/test_manual_wb_warehouse.py
+          tests/test_nomenclature_search.py
+          tests/test_nomenclature_edit_permission.py
+          tests/test_box_scanning.py
+          tests/test_boxes_export.py
+          tests/test_placement_and_boxes.py
+          tests/test_receiving_merged_search_scan.py
+          tests/test_nomenclature_locate_shows_row.py
+
+  deploy:
+    name: Deploy production
+    needs: tests
+    runs-on: ubuntu-22.04
+    env:
+      SERVER_HOST: 195.208.2.185
+      SERVER_USER: root
+      SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+      DEPLOY_SHA: ${{ github.sha }}
+    steps:
+      - name: Check deployment key
+        id: key
+        shell: bash
+        run: |
+          if [ -n "$SERVER_SSH_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SERVER_SSH_KEY is not configured; checks passed, deployment skipped."
+          fi
+
+      - name: Configure SSH
+        if: steps.key.outputs.configured == 'true'
+        shell: bash
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 "$SERVER_HOST" > ~/.ssh/known_hosts
+          ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | grep -F 'SHA256:yxGiCN5Jdh94GGugyAX72ViHkSdNW+AdXm1vXPWg8lM'
+
+      - name: Backup and deploy
+        if: steps.key.outputs.configured == 'true'
+        shell: bash
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$SERVER_USER@$SERVER_HOST" \
+            "DEPLOY_SHA='$DEPLOY_SHA' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/wms
+          previous_sha="$(git rev-parse HEAD)"
+          bash /opt/wms/deploy/backup.sh
+          git fetch origin main
+          git cat-file -e "${DEPLOY_SHA}^{commit}"
+          git reset --hard "$DEPLOY_SHA"
+          /opt/wms/.venv/bin/pip install --quiet \
+            -r /opt/wms/requirements.txt \
+            -r /opt/wms/deploy/requirements-server.txt
+          chown -R wms:wms /opt/wms
+          if ! systemctl restart wms || ! sleep 3 || ! systemctl is-active --quiet wms || \
+             ! curl -fsS http://127.0.0.1:8000/login >/dev/null; then
+            echo "Deployment failed; rolling code back to $previous_sha" >&2
+            git reset --hard "$previous_sha"
+            chown -R wms:wms /opt/wms
+            systemctl restart wms
+            exit 1
+          fi
+          echo "Deployed $(git rev-parse --short HEAD)"
+          REMOTE
