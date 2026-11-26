@@ -245,15 +245,47 @@ def list_warehouses():
 def create_warehouse():
     name = request.form.get("name", "").strip()
     address = request.form.get("address", "").strip()
+    warehouse_type = request.form.get("warehouse_type", "own").strip().lower()
 
     if not name:
         flash("Укажите наименование склада", "danger")
         return redirect(url_for("warehouses.list_warehouses"))
 
-    wh = Warehouse(code=next_number("warehouse"), name=name, address=address)
+    if warehouse_type == "wb":
+        city = canonical_marketplace_city(name)
+        if not city:
+            flash("Укажите наименование склада ВБ", "danger")
+            return redirect(url_for("warehouses.list_warehouses"))
+        duplicate = next(
+            (
+                row
+                for row in Warehouse.query.filter_by(marketplace="wb").all()
+                if canonical_marketplace_city(row.marketplace_city or row.name).casefold()
+                == city.casefold()
+            ),
+            None,
+        )
+        if duplicate:
+            flash(f"Склад ВБ «{city}» уже существует ({duplicate.code})", "danger")
+            return redirect(url_for("warehouses.list_warehouses"))
+        wh = Warehouse(
+            code=next_number("warehouse"),
+            name=city,
+            address=address,
+            marketplace="wb",
+            marketplace_city=city,
+        )
+        display_name = f"ВБ · {city}"
+    elif warehouse_type == "own":
+        wh = Warehouse(code=next_number("warehouse"), name=name, address=address)
+        display_name = name
+    else:
+        flash("Неизвестный тип склада", "danger")
+        return redirect(url_for("warehouses.list_warehouses"))
+
     db.session.add(wh)
     db.session.commit()
-    flash(f"Склад «{name}» создан ({wh.code})", "success")
+    flash(f"Склад «{display_name}» создан ({wh.code})", "success")
     return redirect(url_for("warehouses.list_warehouses"))
 
 
