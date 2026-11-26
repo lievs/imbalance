@@ -5,7 +5,7 @@
 <div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
   <div>
     <h3 class="mb-1">{{ task.number }} · {{ task.title or 'Подбор коробов' }}</h3>
-    <div class="text-muted">Склад: <strong>{{ task.warehouse.name }}</strong> · Исполнитель: {{ task.assigned_to.display_name() if task.assigned_to else 'не назначен' }}</div>
+    <div class="text-muted">Маршрут: <strong>{{ task.warehouse.name }}</strong> → <strong>{{ task.to_warehouse.name if task.to_warehouse else 'склад назначения не выбран' }}</strong> · Исполнитель: {{ task.assigned_to.display_name() if task.assigned_to else 'не назначен' }}</div>
   </div>
   <span class="badge fs-6 {{ 'bg-success' if task.status == 'completed' else 'bg-primary' if task.status == 'in_progress' else 'bg-secondary' }}">{{ status_labels[task.status] }}</span>
 </div>
@@ -20,6 +20,36 @@
     <div class="col-md-4"><button class="btn btn-success btn-lg w-100">✓ Подобран</button></div>
   </form>
 </div>
+{% endif %}
+
+{% if task.movement_document %}
+<div class="alert alert-success d-flex flex-wrap justify-content-between align-items-center gap-2">
+  <span>Подбор завершен, создано перемещение <strong>{{ task.movement_document.number }}</strong>.</span>
+  <a class="btn btn-success" href="{{ url_for('movement.detail', doc_id=task.movement_document_id) }}">Открыть перемещение</a>
+</div>
+{% else %}
+<form method="post" action="{{ url_for('box_picking.finish', task_id=task.id) }}" class="card p-3 mb-3 border-success"
+      onsubmit="return confirm('Завершить подбор и создать документ перемещения?');">
+  <div class="row g-2 align-items-end">
+    {% if not task.to_warehouse %}
+    <div class="col-md-8">
+      <label class="form-label fw-semibold">Склад назначения</label>
+      <select name="to_warehouse_id" class="form-select" required>
+        <option value="">Куда перемещаем</option>
+        {% for wh in destination_warehouses %}<option value="{{ wh.id }}">{{ wh.name }}</option>{% endfor %}
+      </select>
+    </div>
+    {% endif %}
+    <div class="{{ 'col-md-4' if not task.to_warehouse else 'col-12' }}">
+      <button type="submit" class="btn btn-success w-100"
+              {% if task.total_count() == 0 or task.picked_count() != task.total_count() %}disabled{% endif %}>
+        ✓ Завершить подбор и создать перемещение
+      </button>
+    </div>
+  </div>
+  {% if task.total_count() == 0 %}<div class="form-text">Сначала добавьте короба в задание.</div>
+  {% elif task.picked_count() != task.total_count() %}<div class="form-text">Сначала подберите все короба: {{ task.picked_count() }} из {{ task.total_count() }}.</div>{% endif %}
+</form>
 {% endif %}
 
 <div class="d-flex justify-content-between align-items-center mb-2">

@@ -793,6 +793,12 @@ class BoxPickingTask(db.Model):
     number = db.Column(db.String(30), unique=True, nullable=False)
     title = db.Column(db.String(200), nullable=True)
     warehouse_id = db.Column(db.Integer, db.ForeignKey("warehouses.id"), nullable=False)
+    to_warehouse_id = db.Column(
+        db.Integer, db.ForeignKey("warehouses.id"), nullable=True, index=True
+    )
+    movement_document_id = db.Column(
+        db.Integer, db.ForeignKey("movement_documents.id"), nullable=True, index=True
+    )
     status = db.Column(db.String(20), nullable=False, default="new")
     created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
     assigned_to_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
@@ -800,7 +806,11 @@ class BoxPickingTask(db.Model):
     started_at = db.Column(db.DateTime, nullable=True)
     completed_at = db.Column(db.DateTime, nullable=True)
 
-    warehouse = db.relationship("Warehouse")
+    warehouse = db.relationship("Warehouse", foreign_keys=[warehouse_id])
+    to_warehouse = db.relationship("Warehouse", foreign_keys=[to_warehouse_id])
+    movement_document = db.relationship(
+        "MovementDocument", foreign_keys=[movement_document_id]
+    )
     created_by = db.relationship("User", foreign_keys=[created_by_id])
     assigned_to = db.relationship("User", foreign_keys=[assigned_to_id])
     lines = db.relationship(

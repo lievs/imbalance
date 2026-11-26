@@ -5,7 +5,16 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 from flask_login import current_user
 
 from ..extensions import db
-from ..models import Box, BoxPickingTask, BoxPickingTaskLine, MVB_ROLES, User, Warehouse
+from ..models import (
+    Box,
+    BoxPickingTask,
+    BoxPickingTaskLine,
+    MovementDocument,
+    MovementLine,
+    MVB_ROLES,
+    User,
+    Warehouse,
+)
 from ..utils.numbering import next_number
 
 
@@ -83,12 +92,21 @@ def create_task():
         flash("Выберите склад", "danger")
         return render_template("box_picking/create.html", warehouses=warehouses, users=users)
 
+    to_warehouse_id = request.form.get("to_warehouse_id", type=int)
+    to_warehouse = None
+    if to_warehouse_id:
+        to_warehouse = Warehouse.query.filter_by(id=to_warehouse_id, is_active=True).first()
+        if to_warehouse is None or to_warehouse.id == warehouse.id:
+            flash("Выберите другой активный склад назначения", "danger")
+            return render_template("box_picking/create.html", warehouses=warehouses, users=users)
+
     assigned_to_id = request.form.get("assigned_to_id", type=int)
     assigned_to = User.query.filter_by(id=assigned_to_id, is_active_user=True).first() if assigned_to_id else None
     task = BoxPickingTask(
         number=next_number("box_picking"),
         title=request.form.get("title", "").strip() or None,
         warehouse=warehouse,
+        to_warehouse=to_warehouse,
         created_by=current_user,
         assigned_to=assigned_to,
     )
@@ -181,6 +199,13 @@ def detail(task_id):
         "box_picking/detail.html",
         task=task,
         lines=lines,
+        destination_warehouses=(
+            Warehouse.query.filter(
+                Warehouse.is_active.is_(True), Warehouse.id != task.warehouse_id
+            )
+            .order_by(Warehouse.name)
+            .all()
+        ),
         status_labels=STATUS_LABELS,
     )
 
@@ -256,9 +281,111 @@ def remove_line(task_id, line_id):
     return redirect(url_for("box_picking.detail", task_id=task.id))
 
 
+@bp.route("/<int:task_id>/finish", methods=["POST"])
+def finish(task_id):
+    task = BoxPickingTask.query.get_or_404(task_id)
+    if task.movement_document_id:
+        flash(
+            f"Перемещение {task.movement_document.number} уже создано",
+            "info",
+        )
+        return redirect(url_for("movement.detail", doc_id=task.movement_document_id))
+
+    total = task.total_count()
+    picked = task.picked_count()
+    if total == 0:
+        flash("В задании нет коробов", "danger")
+        return redirect(url_for("box_picking.detail", task_id=task.id))
+    if picked != total:
+        flash(f"Сначала подберите все короба: {picked} из {total}", "danger")
+        return redirect(url_for("box_picking.detail", task_id=task.id))
+
+    to_warehouse_id = task.to_warehouse_id or request.form.get(
+        "to_warehouse_id", type=int
+    )
+    to_warehouse = Warehouse.query.filter_by(
+        id=to_warehouse_id, is_active=True
+    ).first()
+    if to_warehouse is None or to_warehouse.id == task.warehouse_id:
+        flash("Выберите другой активный склад назначения", "danger")
+        return redirect(url_for("box_picking.detail", task_id=task.id))
+
+    task_lines = task.lines.order_by(BoxPickingTaskLine.id).all()
+    wrong_warehouse = [
+        line.box.box_number
+        for line in task_lines
+        if line.box.warehouse_id != task.warehouse_id
+    ]
+    if wrong_warehouse:
+        flash(
+            "Короба уже не находятся на складе задания: "
+            + ", ".join(wrong_warehouse[:10]),
+            "danger",
+        )
+        return redirect(url_for("box_picking.detail", task_id=task.id))
+
+    box_ids = [line.box_id for line in task_lines]
+    conflicts = (
+        MovementLine.query.join(MovementDocument)
+        .filter(
+            MovementLine.box_id.in_(box_ids),
+            db.or_(
+                MovementDocument.status.in_(("draft", "collected")),
+                db.and_(
+                    MovementDocument.status == "completed",
+                    MovementDocument.received_at.is_(None),
+                ),
+            ),
+        )
+        .all()
+    )
+    if conflicts:
+        numbers = sorted({line.box.box_number for line in conflicts})
+        flash(
+            "Короба уже находятся в активном перемещении: "
+            + ", ".join(numbers[:10]),
+            "danger",
+        )
+        return redirect(url_for("box_picking.detail", task_id=task.id))
+
+    movement = MovementDocument(
+        number=next_number("movement"),
+        from_warehouse_id=task.warehouse_id,
+        to_warehouse_id=to_warehouse.id,
+        created_by_id=current_user.id,
+    )
+    db.session.add(movement)
+    db.session.flush()
+    for task_line in task_lines:
+        box = task_line.box
+        db.session.add(
+            MovementLine(
+                document_id=movement.id,
+                box_id=box.id,
+                from_warehouse_id=box.warehouse_id,
+                from_cell_id=box.cell_id,
+            )
+        )
+
+    task.to_warehouse = to_warehouse
+    task.movement_document = movement
+    task.status = "completed"
+    task.completed_at = task.completed_at or datetime.utcnow()
+    db.session.commit()
+    flash(
+        f"Подбор завершен. Создано перемещение {movement.number}: "
+        f"{len(task_lines)} короб(ов)",
+        "success",
+    )
+    return redirect(url_for("movement.detail", doc_id=movement.id))
+
+
 @bp.route("/<int:task_id>/reopen", methods=["POST"])
 def reopen(task_id):
     task = BoxPickingTask.query.get_or_404(task_id)
+    if task.movement_document_id:
+        flash("По заданию уже создано перемещение — открыть его заново нельзя", "warning")
+        return redirect(url_for("movement.detail", doc_id=task.movement_document_id))
     if not current_user.is_admin:
         flash("Открыть задание заново может только администратор", "danger")
         return redirect(url_for("box_picking.detail", task_id=task.id))

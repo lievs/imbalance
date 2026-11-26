@@ -17,13 +17,13 @@
 
 <div class="table-responsive">
 <table class="table table-hover align-middle">
-  <thead><tr><th>Номер</th><th>Задание</th><th>Склад</th><th>Исполнитель</th><th>Прогресс</th><th>Статус</th><th>Создано</th></tr></thead>
+  <thead><tr><th>Номер</th><th>Задание</th><th>Маршрут</th><th>Исполнитель</th><th>Прогресс</th><th>Статус</th><th>Создано</th></tr></thead>
   <tbody>
   {% for task in tasks %}
     <tr>
       <td><a href="{{ url_for('box_picking.detail', task_id=task.id) }}" class="fw-semibold">{{ task.number }}</a></td>
       <td>{{ task.title or 'Подбор коробов' }}</td>
-      <td>{{ task.warehouse.name }}</td>
+      <td>{{ task.warehouse.name }} → {{ task.to_warehouse.name if task.to_warehouse else 'не выбран' }}</td>
       <td>{{ task.assigned_to.display_name() if task.assigned_to else 'Не назначен' }}</td>
       <td>{{ task.picked_count() }} / {{ task.total_count() }}</td>
       <td><span class="badge {{ 'bg-success' if task.status == 'completed' else 'bg-primary' if task.status == 'in_progress' else 'bg-secondary' }}">{{ status_labels[task.status] }}</span></td>

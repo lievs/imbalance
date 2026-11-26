@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from wms.extensions import db
 from wms.models import (
     Box,
@@ -5,6 +7,8 @@ from wms.models import (
     BoxPickingTask,
     BoxPickingTaskLine,
     Cell,
+    MovementDocument,
+    MovementLine,
     Warehouse,
     Zone,
 )
@@ -154,6 +158,56 @@ def test_add_selected_boxes_from_box_list(client_logged_in, app):
             "BOX-800001",
             "BOX-800002",
         }
+
+
+def test_finish_picking_creates_one_movement_document(client_logged_in, app):
+    with app.app_context():
+        source, boxes = _warehouse_with_boxes()
+        destination = Warehouse(code="PICK-DEST", name="Склад назначения")
+        task = BoxPickingTask(
+            number="POD-900003",
+            warehouse=source,
+            to_warehouse=destination,
+            status="completed",
+            completed_at=datetime.utcnow(),
+        )
+        db.session.add_all([destination, task])
+        db.session.flush()
+        now = datetime.utcnow()
+        db.session.add_all([
+            BoxPickingTaskLine(task=task, box=box, picked_at=now)
+            for box in boxes
+        ])
+        db.session.commit()
+        task_id = task.id
+        source_id = source.id
+        destination_id = destination.id
+
+    response = client_logged_in.post(
+        f"/box-picking/{task_id}/finish", follow_redirects=True
+    )
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "Подбор завершен. Создано перемещение" in html
+
+    with app.app_context():
+        task = db.session.get(BoxPickingTask, task_id)
+        movement = MovementDocument.query.one()
+        assert task.movement_document_id == movement.id
+        assert movement.from_warehouse_id == source_id
+        assert movement.to_warehouse_id == destination_id
+        assert movement.status == "draft"
+        assert {line.box.box_number for line in movement.lines.all()} == {
+            "BOX-800001",
+            "BOX-800002",
+        }
+        assert MovementLine.query.count() == 2
+
+    client_logged_in.post(f"/box-picking/{task_id}/finish")
+    with app.app_context():
+        assert MovementDocument.query.count() == 1
+        assert MovementLine.query.count() == 2
+
 
 
 def test_removed_modules_are_not_registered_and_not_in_menu(client_logged_in, app):

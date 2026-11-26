@@ -13,6 +13,13 @@
       </select>
     </div>
     <div class="col-md-6">
+      <label class="form-label">Склад назначения</label>
+      <select name="to_warehouse_id" class="form-select" required>
+        <option value="">Куда перемещаем</option>
+        {% for wh in warehouses %}<option value="{{ wh.id }}">{{ wh.name }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="col-md-6">
       <label class="form-label">Исполнитель</label>
       <select name="assigned_to_id" class="form-select">
         <option value="">Не назначен</option>
