@@ -744,6 +744,21 @@ def _seed_standalone_warehouses():
         print(f"[bootstrap] Созданы склады: {', '.join(created)}")
 
 
+def _seed_box_cabinets():
+    """Создает четыре стартовых кабинета, не меняя сохраненные настройки."""
+    from .models import BoxCabinet
+
+    created = []
+    for prefix in ("A", "B", "IM", "V"):
+        if BoxCabinet.query.filter_by(prefix=prefix).first():
+            continue
+        db.session.add(BoxCabinet(name=f"Кабинет {prefix}", prefix=prefix))
+        created.append(prefix)
+    db.session.commit()
+    if created:
+        print(f"[bootstrap] Созданы кабинеты коробов: {', '.join(created)}")
+
+
 # Эндпоинты вне приемки/перемещений, доступные роли "фулфилмент" (см. чат:
 # видят свой склад, печатают стикеры своих коробов, видят общую номенклатуру,
 # при приемке подтягивается вся номенклатура). Только чтение и печать; кто
@@ -872,6 +887,7 @@ def create_app(config_class=Config):
                 _seed_mvb_default_schedules()
         if app.config.get("STANDALONE_COMPANY_MODE") and not app.config.get("TESTING"):
             _seed_standalone_warehouses()
+        _seed_box_cabinets()
         _bootstrap_admin()
         bootstrap_categories()
 

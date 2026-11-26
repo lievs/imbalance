@@ -73,7 +73,11 @@
         <button type="button" class="btn btn-outline-primary" data-camera-scan-target="#boxNumberInput" title="Сканировать камерой">📷</button>
         <button type="submit" class="btn btn-primary">Выбрать</button>
       </form>
-      <form method="post" action="{{ url_for('placement.create_box', doc_id=doc.id) }}">
+      <form method="post" action="{{ url_for('placement.create_box', doc_id=doc.id) }}" class="d-flex gap-2">
+        <select name="cabinet_id" class="form-select" required>
+          <option value="">Кабинет...</option>
+          {% for cabinet in box_cabinets %}<option value="{{ cabinet.id }}">{{ cabinet.prefix }} — {{ cabinet.name }}</option>{% endfor %}
+        </select>
         <button type="submit" class="btn btn-outline-primary">📦 Создать новый короб</button>
       </form>
     </div>

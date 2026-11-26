@@ -14,7 +14,7 @@
 <div class="label-page">
   <img src="{{ barcode_img }}" alt="barcode" class="label-img-lg">
   <div class="label-title label-title-lg">{{ box.box_number }}</div>
-  <div class="label-subtitle">{{ box.warehouse.name if box.warehouse else '' }}</div>
+  <div class="label-subtitle">{% if box.cabinet %}{{ box.cabinet.name }} · {% endif %}{{ box.warehouse.name if box.warehouse else '' }}</div>
 </div>
 
 <script src="{{ url_for('static', filename='js/app.js') }}"></script>

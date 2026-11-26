@@ -2,10 +2,10 @@ from flask import Blueprint, Response, abort, flash, redirect, render_template, 
 from flask_login import current_user
 
 from ..extensions import db
-from ..models import Box, BoxItem, Nomenclature, Warehouse
+from ..models import Box, BoxCabinet, BoxItem, Nomenclature, Warehouse
 from ..utils.excel_io import export_boxes_to_excel, timestamp_for_filename
 from ..utils.http import content_disposition
-from ..utils.numbering import next_number
+from ..utils.numbering import next_box_number
 from .movement import flag_movement_dirty_for_box
 
 bp = Blueprint("boxes", __name__)
@@ -22,6 +22,7 @@ def list_boxes():
     warehouses = Warehouse.query.order_by(Warehouse.code).all()
 
     warehouse_id = request.args.get("warehouse_id", type=int)
+    cabinet_id = request.args.get("cabinet_id", type=int)
     query_text = request.args.get("q", "").strip()
     if current_user.is_fulfillment_only():
         # Фулфилмент видит только короба своего склада (см. чат) — любой
@@ -32,6 +33,8 @@ def list_boxes():
     query = Box.query
     if warehouse_id:
         query = query.filter_by(warehouse_id=warehouse_id)
+    if cabinet_id:
+        query = query.filter_by(cabinet_id=cabinet_id)
     if query_text:
         query = query.filter(Box.box_number.ilike(f"%{query_text}%"))
 
@@ -52,6 +55,8 @@ def list_boxes():
         boxes=boxes,
         warehouses=warehouses,
         warehouse_id=warehouse_id,
+        cabinet_id=cabinet_id,
+        cabinets=BoxCabinet.query.order_by(BoxCabinet.prefix).all(),
         query_text=query_text,
         item_counts=item_counts,
     )
@@ -222,13 +227,20 @@ def bulk_create():
     пустым в ячейку/зону)."""
     if request.method == "GET":
         warehouses = Warehouse.query.filter_by(is_active=True).order_by(Warehouse.code).all()
-        return render_template("boxes/bulk_create.html", warehouses=warehouses)
+        cabinets = BoxCabinet.query.filter_by(is_active=True).order_by(BoxCabinet.prefix).all()
+        return render_template("boxes/bulk_create.html", warehouses=warehouses, cabinets=cabinets)
 
     warehouse_id = request.form.get("warehouse_id", type=int)
+    cabinet_id = request.form.get("cabinet_id", type=int)
     count = request.form.get("count", type=int)
 
     if not warehouse_id:
         flash("Выберите склад", "danger")
+        return redirect(url_for("boxes.bulk_create"))
+
+    cabinet = BoxCabinet.query.filter_by(id=cabinet_id, is_active=True).first()
+    if not cabinet:
+        flash("Выберите активный кабинет", "danger")
         return redirect(url_for("boxes.bulk_create"))
 
     if not count or count < 1 or count > 500:
@@ -237,10 +249,39 @@ def bulk_create():
 
     created = []
     for _ in range(count):
-        box = Box(box_number=next_number("box"), warehouse_id=warehouse_id, status="open")
+        box = Box(
+            box_number=next_box_number(cabinet),
+            warehouse_id=warehouse_id,
+            cabinet_id=cabinet.id,
+            status="open",
+        )
         db.session.add(box)
         created.append(box)
     db.session.commit()
 
     flash(f"Создано коробов: {len(created)}", "success")
     return render_template("boxes/bulk_result.html", boxes=created)
+
+
+@bp.route("/cabinets/<int:cabinet_id>/update", methods=["POST"])
+def update_cabinet(cabinet_id):
+    if not current_user.is_admin:
+        abort(403)
+    cabinet = BoxCabinet.query.get_or_404(cabinet_id)
+    name = request.form.get("name", "").strip()
+    prefix = request.form.get("prefix", "").strip().upper()
+    if not name or not prefix or len(prefix) > 10 or not prefix.isalnum():
+        flash("Укажите название и префикс до 10 букв/цифр", "danger")
+        return redirect(url_for("warehouses.list_warehouses"))
+    duplicate = BoxCabinet.query.filter(
+        BoxCabinet.prefix == prefix, BoxCabinet.id != cabinet.id
+    ).first()
+    if duplicate:
+        flash(f"Префикс {prefix} уже используется", "danger")
+        return redirect(url_for("warehouses.list_warehouses"))
+    cabinet.name = name
+    cabinet.prefix = prefix
+    cabinet.is_active = request.form.get("is_active") == "on"
+    db.session.commit()
+    flash(f"Кабинет «{name}» сохранен", "success")
+    return redirect(url_for("warehouses.list_warehouses"))

@@ -26,12 +26,13 @@
       <button type="submit" class="btn btn-primary">🖨 Печать выбранных этикеток</button>
     </div>
     <table class="table table-sm mb-0">
-      <thead><tr><th></th><th>Номер короба</th><th>Склад</th></tr></thead>
+      <thead><tr><th></th><th>Номер короба</th><th>Кабинет</th><th>Склад</th></tr></thead>
       <tbody>
       {% for box in boxes %}
         <tr>
           <td><input type="checkbox" name="ids" value="{{ box.id }}" checked></td>
           <td><a href="{{ url_for('boxes.detail', box_id=box.id) }}">{{ box.box_number }}</a></td>
+          <td>{{ box.cabinet.name if box.cabinet else 'Не указан' }}</td>
           <td>{{ box.warehouse.name }}</td>
         </tr>
       {% endfor %}

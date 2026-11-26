@@ -23,6 +23,7 @@ from ..extensions import db
 from ..models import (
     AppSetting,
     Box,
+    BoxCabinet,
     BoxItem,
     Nomenclature,
     PHYSICAL_STOCK_WAREHOUSE_NAMES,
@@ -39,7 +40,7 @@ from ..models import (
 from ..utils.document_access import get_owned_or_404
 from ..utils.excel_io import export_receiving_to_excel, timestamp_for_filename
 from ..utils.http import content_disposition
-from ..utils.numbering import next_number
+from ..utils.numbering import next_box_number, next_number
 from ..utils.receiving_invoice_import import InvoiceParseError, parse_invoice
 from ..utils.timezone import to_moscow
 from ..utils.work_log import log_pack
@@ -713,6 +714,7 @@ def detail(doc_id):
         active_box=active_box,
         packed_boxes=packed_boxes,
         warehouses=warehouses,
+        box_cabinets=BoxCabinet.query.filter_by(is_active=True).order_by(BoxCabinet.prefix).all(),
         add_request_token=secrets.token_urlsafe(24),
     )
 
@@ -889,7 +891,22 @@ def create_box(doc_id):
         flash("Документ уже завершен", "danger")
         return redirect(url_for("receiving.detail", doc_id=doc.id))
 
-    box = Box(box_number=next_number("box"), warehouse_id=doc.warehouse_id, status="open")
+    cabinet_id = request.form.get("cabinet_id", type=int)
+    cabinet = (
+        BoxCabinet.query.filter_by(id=cabinet_id, is_active=True).first()
+        if cabinet_id
+        else BoxCabinet.query.filter_by(is_active=True).order_by(BoxCabinet.id).first()
+    )
+    if not cabinet:
+        flash("Выберите активный кабинет", "danger")
+        return redirect(url_for("receiving.detail", doc_id=doc.id))
+
+    box = Box(
+        box_number=next_box_number(cabinet),
+        warehouse_id=doc.warehouse_id,
+        cabinet_id=cabinet.id,
+        status="open",
+    )
     db.session.add(box)
     db.session.commit()
     flash(f"Короб {box.box_number} создан", "success")

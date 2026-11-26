@@ -29,6 +29,15 @@
       </select>
     </div>
     <div class="col-auto">
+      <label class="form-label mb-0 small">Кабинет</label>
+      <select name="cabinet_id" class="form-select form-select-sm">
+        <option value="">Все кабинеты</option>
+        {% for cabinet in cabinets %}
+          <option value="{{ cabinet.id }}" {% if cabinet.id == cabinet_id %}selected{% endif %}>{{ cabinet.prefix }} — {{ cabinet.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-auto">
       <label class="form-label mb-0 small">Номер короба содержит</label>
       <input type="text" name="q" class="form-control form-control-sm" value="{{ query_text }}" placeholder="BOX-0012">
     </div>
@@ -59,6 +68,7 @@
           <tr>
             <th></th>
             <th>Номер короба</th>
+            <th class="d-none d-md-table-cell">Кабинет</th>
             <th class="d-none d-md-table-cell">Склад</th>
             <th class="d-none d-md-table-cell">Статус</th>
             <th class="d-none d-md-table-cell">Позиций</th>
@@ -74,10 +84,11 @@
             <td>
               <a href="{{ url_for('boxes.detail', box_id=box.id) }}">{{ box.box_number }}</a>
               <div class="small text-muted d-md-none">
-                {{ box.warehouse.name if box.warehouse else '' }} · {{ 'Расставлен' if box.cell_id or box.zone_id else 'Открыт' }}
+                {{ box.cabinet.name if box.cabinet else 'Кабинет не указан' }} · {{ box.warehouse.name if box.warehouse else '' }} · {{ 'Расставлен' if box.cell_id or box.zone_id else 'Открыт' }}
                 {% if item_count == 0 %}· <span class="badge bg-warning text-dark">Пусто</span>{% else %}· {{ item_count }} поз.{% endif %}
               </div>
             </td>
+            <td class="d-none d-md-table-cell">{{ box.cabinet.name if box.cabinet else '—' }}</td>
             <td class="d-none d-md-table-cell">{{ box.warehouse.name if box.warehouse else '' }}</td>
             <td class="d-none d-md-table-cell">{{ 'Расставлен' if box.cell_id or box.zone_id else 'Открыт' }}</td>
             <td class="d-none d-md-table-cell">

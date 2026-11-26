@@ -28,6 +28,21 @@ class AppSetting(db.Model):
     value = db.Column(db.Text)
 
 
+class BoxCabinet(db.Model):
+    """Настраиваемый кабинет, для которого предназначен короб."""
+
+    __tablename__ = "box_cabinets"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    prefix = db.Column(db.String(10), unique=True, nullable=False)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<BoxCabinet {self.prefix}>"
+
+
 class ProductCategory(db.Model):
     """Вид товара (свитер/кардиган/шапка/...) — определяется автоматически
     по вхождению ключевого слова в название товара при создании/импорте
@@ -633,6 +648,7 @@ class Box(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     box_number = db.Column(db.String(30), unique=True, nullable=False)
     warehouse_id = db.Column(db.Integer, db.ForeignKey("warehouses.id"), nullable=False, index=True)
+    cabinet_id = db.Column(db.Integer, db.ForeignKey("box_cabinets.id"), nullable=True, index=True)
     cell_id = db.Column(db.Integer, db.ForeignKey("cells.id"), nullable=True, index=True)
     # Ряд, в который короб размещен НАПРЯМУЮ, без конкретной ячейки — для
     # помещений без возможности завести ячейки (см. чат). Взаимоисключимо с
@@ -659,6 +675,7 @@ class Box(db.Model):
     last_scanned_by_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
 
     warehouse = db.relationship("Warehouse", foreign_keys=[warehouse_id])
+    cabinet = db.relationship("BoxCabinet", foreign_keys=[cabinet_id])
     last_scanned_by = db.relationship("User", foreign_keys=[last_scanned_by_id])
     items = db.relationship(
         "BoxItem", backref="box", lazy="dynamic", cascade="all, delete-orphan"
@@ -691,7 +708,7 @@ class Box(db.Model):
     @property
     def barcode_value(self):
         """Значение, которое реально кодируется в штрихкод короба — только
-        цифры, без префикса "BOX-". Код128 при смешении букв и цифр
+        цифры, без префикса кабинета (или старого "BOX-"). Код128 при смешении букв и цифр
         переключается между наборами B/C прямо посередине кода, и часть
         сканеров считывает такой штрихкод с ошибкой (путает цифры).
         Чисто цифровой код кодируется одним набором C без переключений и
@@ -703,7 +720,7 @@ class Box(db.Model):
     @staticmethod
     def find_by_scanned_code(code, warehouse_id=None):
         """Находит короб по отсканированному/введенному значению — принимает
-        как полный номер ("BOX-000123", вручную с клавиатуры), так и чисто
+        как полный номер ("IM-000123"/"BOX-000123", вручную с клавиатуры), так и чисто
         цифровой штрихкод ("000123", как реально закодировано в barcode_value
         начиная с этой правки) — иначе после смены формата штрихкода старые
         места ввода перестали бы находить короб по сканированию."""
@@ -723,8 +740,8 @@ class Box(db.Model):
             # таблицы boxes на КАЖДЫЙ скан короба. При десятках-сотнях тысяч
             # коробов это и давало заметные тормоза именно там, где сканируют
             # чаще всего (приемка, размещение, перемещение). Номер короба
-            # всегда имеет вид "<префикс><цифры фиксированной ширины>"
-            # (см. utils.numbering.SERIES["box"]), поэтому сначала пробуем
+            # всегда заканчивается цифрами фиксированной ширины. Сначала
+            # пробуем старый BOX-префикс, затем префиксы кабинетов, чтобы
             # восстановить точный номер и найти его обычным (быстрым,
             # индексированным) точным совпадением.
             from .utils.numbering import SERIES
@@ -734,6 +751,12 @@ class Box(db.Model):
                 box = query.filter_by(box_number=f"{prefix}{code}").first()
                 if box is not None:
                     return box
+                # Новые короба используют настраиваемые префиксы. Ищем
+                # точными индексированными запросами, не сканируя всю таблицу.
+                for cabinet_prefix, in db.session.query(BoxCabinet.prefix).all():
+                    box = query.filter_by(box_number=f"{cabinet_prefix}-{code}").first()
+                    if box is not None:
+                        return box
             # Редкий случай (код нестандартной ширины/легаси-номер) —
             # полное сканирование как раньше, только если быстрый путь не сработал.
             box = query.filter(Box.box_number.like(f"%{code}")).first()

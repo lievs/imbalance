@@ -72,7 +72,7 @@ def box_label_pdf(box_id):
     box = Box.query.get_or_404(box_id)
     if not _box_allowed(box):
         abort(404)
-    subtitle = box.warehouse.name if box.warehouse else ""
+    subtitle = _box_subtitle(box)
     pdf = build_label_pdf(
         box.barcode_value, box.box_number, subtitle,
         title_font_size=BOX_TITLE_FONT_SIZE, max_img_h_ratio=BOX_MAX_IMG_H_RATIO, subtitle_gap_mm=BOX_SUBTITLE_GAP_MM,
@@ -107,7 +107,7 @@ def boxes_label_batch_pdf():
         box = boxes_by_id.get(box_id)
         if not box or not _box_allowed(box):
             continue
-        subtitle = box.warehouse.name if box.warehouse else ""
+        subtitle = _box_subtitle(box)
         entries.append((box.barcode_value, box.box_number, subtitle))
 
     if not entries:
@@ -123,6 +123,15 @@ def boxes_label_batch_pdf():
         mimetype="application/pdf",
         headers={"Content-Disposition": content_disposition("boxes_batch.pdf", "inline")},
     )
+
+
+def _box_subtitle(box):
+    parts = []
+    if box.cabinet:
+        parts.append(box.cabinet.name)
+    if box.warehouse:
+        parts.append(box.warehouse.name)
+    return " · ".join(parts)
 
 
 @bp.route("/box/<int:box_id>/items")

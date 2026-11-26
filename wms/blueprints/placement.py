@@ -17,6 +17,7 @@ from sqlalchemy import and_, func
 from ..extensions import db
 from ..models import (
     Box,
+    BoxCabinet,
     BoxItem,
     Cell,
     CELL_CAPACITY,
@@ -32,7 +33,7 @@ from ..models import (
 from ..utils.excel_io import export_placement_to_excel, timestamp_for_filename
 from ..utils.document_access import ensure_view_document_access, owned_query
 from ..utils.http import content_disposition
-from ..utils.numbering import next_number
+from ..utils.numbering import next_box_number, next_number
 from ..utils.work_log import log_pack
 
 bp = Blueprint("placement", __name__)
@@ -562,6 +563,7 @@ def detail(doc_id):
         other_open_boxes=other_open_boxes,
         available_stock=available_stock,
         active_box=active_box,
+        box_cabinets=BoxCabinet.query.filter_by(is_active=True).order_by(BoxCabinet.prefix).all(),
         cell_suggestions=cell_suggestions,
     )
 
@@ -744,9 +746,20 @@ def create_box(doc_id):
         flash("Документ уже завершен", "danger")
         return redirect(url_for("placement.detail", doc_id=doc.id))
 
+    cabinet_id = request.form.get("cabinet_id", type=int)
+    cabinet = (
+        BoxCabinet.query.filter_by(id=cabinet_id, is_active=True).first()
+        if cabinet_id
+        else BoxCabinet.query.filter_by(is_active=True).order_by(BoxCabinet.id).first()
+    )
+    if not cabinet:
+        flash("Выберите активный кабинет", "danger")
+        return redirect(url_for("placement.detail", doc_id=doc.id))
+
     box = Box(
-        box_number=next_number("box"),
+        box_number=next_box_number(cabinet),
         warehouse_id=doc.warehouse_id,
+        cabinet_id=cabinet.id,
         placement_document_id=doc.id,
         status="open",
     )

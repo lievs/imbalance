@@ -2,7 +2,7 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 from flask_login import current_user
 
 from ..extensions import db
-from ..models import Box, Cell, ShipmentPlanLine, UnplacedStock, Warehouse, Zone
+from ..models import Box, BoxCabinet, Cell, ShipmentPlanLine, UnplacedStock, Warehouse, Zone
 from ..utils.numbering import next_number
 from ..utils.shipment_plan_import import canonical_marketplace_city
 
@@ -237,6 +237,7 @@ def list_warehouses():
         warehouses=warehouses,
         fulfillment_warehouses=fulfillment_warehouses,
         own_mapping_warehouses=own_mapping_warehouses,
+        box_cabinets=BoxCabinet.query.order_by(BoxCabinet.id).all(),
     )
 
 

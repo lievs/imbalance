@@ -46,3 +46,8 @@ def next_number(key: str, prefix: str = None, width: int = None) -> str:
     ).scalar_one()
 
     return f"{prefix}{value:0{width}d}"
+
+
+def next_box_number(cabinet) -> str:
+    """Следующий глобально уникальный номер с префиксом кабинета."""
+    return next_number("box", prefix=f"{cabinet.prefix}-", width=SERIES["box"][1])
