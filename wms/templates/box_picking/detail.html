@@ -12,10 +12,10 @@
 
 {% if task.status != 'completed' %}
 <div class="card p-3 mb-3 border-primary">
-  <form method="post" action="{{ url_for('box_picking.scan', task_id=task.id) }}" class="row g-2 align-items-end">
+  <form id="boxPickingScanForm" method="post" action="{{ url_for('box_picking.scan', task_id=task.id) }}" class="row g-2 align-items-end">
     <div class="col-md-8">
       <label class="form-label fw-semibold">Сканировать подобранный короб</label>
-      <input id="boxScan" name="box_code" class="form-control form-control-lg" autocomplete="off" autofocus required placeholder="Штрихкод короба">
+      <input id="boxScan" name="box_code" class="form-control form-control-lg" autocomplete="off" autofocus required data-auto-submit placeholder="Штрихкод короба">
     </div>
     <div class="col-md-4"><button class="btn btn-success btn-lg w-100">✓ Подобран</button></div>
   </form>
@@ -69,4 +69,36 @@
   <form method="post" action="{{ url_for('box_picking.delete_task', task_id=task.id) }}" onsubmit="return confirm('Удалить задание целиком?')"><button class="btn btn-outline-danger">Удалить задание</button></form>
 </div>
 {% endif %}
+{% endblock %}
+
+
+{% block scripts %}
+<script>
+(function () {
+  var form = document.getElementById("boxPickingScanForm");
+  var input = document.querySelector("[data-auto-submit]");
+  if (!form || !input) return;
+
+  var timer = null;
+  var submitting = false;
+  function submitScan() {
+    if (submitting || !input.value.trim()) return;
+    submitting = true;
+    if (typeof form.requestSubmit === "function") form.requestSubmit();
+    else form.submit();
+  }
+
+  // Большинство сканеров вводят код очень быстро, но не все отправляют
+  // Enter. Короткая пауза отделяет окончание скана от отдельных символов.
+  input.addEventListener("input", function () {
+    window.clearTimeout(timer);
+    if (!input.value.trim()) return;
+    timer = window.setTimeout(submitScan, 250);
+  });
+  form.addEventListener("submit", function () {
+    submitting = true;
+    window.clearTimeout(timer);
+  });
+})();
+</script>
 {% endblock %}

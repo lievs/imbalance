@@ -48,6 +48,8 @@ def test_create_task_shows_current_box_locations(client_logged_in, app):
     assert "Рейс №15" in html
     assert "ячейке A001" in html
     assert "ряду A" in html
+    assert 'data-auto-submit' in html
+    assert 'setTimeout(submitScan, 250)' in html
 
     with app.app_context():
         task = BoxPickingTask.query.one()
