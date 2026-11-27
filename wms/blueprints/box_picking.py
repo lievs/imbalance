@@ -150,6 +150,9 @@ def create_task():
     task = BoxPickingTask(
         number=next_number("box_picking"),
         title=request.form.get("title", "").strip() or None,
+        marketplace_request_number=request.form.get(
+            "marketplace_request_number", ""
+        ).strip()[:50] or None,
         warehouse=warehouse,
         to_warehouse=to_warehouse,
         created_by=current_user,
@@ -323,6 +326,23 @@ def detail(task_id):
     )
 
 
+@bp.route("/<int:task_id>/marketplace-request", methods=["POST"])
+def update_marketplace_request(task_id):
+    task = BoxPickingTask.query.get_or_404(task_id)
+    if task.movement_document_id:
+        flash("Номер заявки уже перенесён в созданное перемещение", "warning")
+        return redirect(url_for("box_picking.detail", task_id=task.id))
+    if not current_user.is_admin and task.created_by_id != current_user.id:
+        flash("Изменить номер заявки может автор задания или администратор", "danger")
+        return redirect(url_for("box_picking.detail", task_id=task.id))
+    task.marketplace_request_number = request.form.get(
+        "marketplace_request_number", ""
+    ).strip()[:50] or None
+    db.session.commit()
+    flash("Номер заявки на МП сохранён", "success")
+    return redirect(url_for("box_picking.detail", task_id=task.id))
+
+
 @bp.route("/<int:task_id>/boxes", methods=["POST"])
 def add_boxes(task_id):
     task = BoxPickingTask.query.get_or_404(task_id)
@@ -468,6 +488,7 @@ def finish(task_id):
         from_warehouse_id=task.warehouse_id,
         to_warehouse_id=to_warehouse.id,
         created_by_id=current_user.id,
+        marketplace_request_number=task.marketplace_request_number,
     )
     db.session.add(movement)
     db.session.flush()

@@ -49,6 +49,7 @@ def test_create_task_shows_current_box_locations(client_logged_in, app):
         data={
             "warehouse_id": warehouse_id,
             "title": "Рейс №15",
+            "marketplace_request_number": "MP-1500",
             "box_codes": "BOX-800001\nBOX-800002",
         },
         follow_redirects=True,
@@ -67,6 +68,7 @@ def test_create_task_shows_current_box_locations(client_logged_in, app):
         task = BoxPickingTask.query.one()
         assert task.total_count() == 2
         assert task.status == "new"
+        assert task.marketplace_request_number == "MP-1500"
 
 
 def test_scan_only_task_boxes_and_complete_task(client_logged_in, app):
@@ -178,6 +180,7 @@ def test_finish_picking_creates_one_movement_document(client_logged_in, app):
             number="POD-900003",
             warehouse=source,
             to_warehouse=destination,
+            marketplace_request_number="MP-900003",
             status="completed",
             completed_at=datetime.utcnow(),
         )
@@ -207,6 +210,7 @@ def test_finish_picking_creates_one_movement_document(client_logged_in, app):
         assert movement.from_warehouse_id == source_id
         assert movement.to_warehouse_id == destination_id
         assert movement.status == "draft"
+        assert movement.marketplace_request_number == "MP-900003"
         assert {line.box.box_number for line in movement.lines.all()} == {
             "BOX-800001",
             "BOX-800002",
@@ -267,6 +271,25 @@ def test_task_can_be_loaded_from_excel_template(client_logged_in, app):
     assert response.status_code == 200
     with app.app_context():
         assert BoxPickingTask.query.one().total_count() == 2
+
+
+def test_marketplace_request_can_be_added_after_task_creation(client_logged_in, app):
+    with app.app_context():
+        warehouse, _ = _warehouse_with_boxes()
+        task = BoxPickingTask(number="POD-MP-EDIT", warehouse=warehouse)
+        db.session.add(task)
+        db.session.commit()
+        task_id = task.id
+
+    response = client_logged_in.post(
+        f"/box-picking/{task_id}/marketplace-request",
+        data={"marketplace_request_number": "WB-777"},
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert "WB-777" in response.get_data(as_text=True)
+    with app.app_context():
+        assert db.session.get(BoxPickingTask, task_id).marketplace_request_number == "WB-777"
 
 
 def test_removed_modules_are_not_registered_and_not_in_menu(client_logged_in, app):

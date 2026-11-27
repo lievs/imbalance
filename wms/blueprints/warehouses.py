@@ -390,6 +390,7 @@ def import_recipients():
         warehouse.name = city if marketplace else record["name"]
         warehouse.address = record["address"] or None
         warehouse.recipient_info = record["recipient_info"] or None
+        warehouse.is_recipient = True
         warehouse.is_active = active
         warehouse.marketplace = marketplace
         warehouse.marketplace_city = city
@@ -488,6 +489,9 @@ def update_fulfillment_1c_name(warehouse_id):
 @bp.route("/<int:warehouse_id>/cells")
 def cells(warehouse_id):
     wh = Warehouse.query.get_or_404(warehouse_id)
+    if wh.is_recipient or wh.marketplace:
+        flash("Для склада-получателя ячейки не используются", "info")
+        return redirect(url_for("warehouses.list_warehouses"))
     cell_list = Cell.query.filter_by(warehouse_id=wh.id).order_by(Cell.code).all()
     zone_list = Zone.query.filter_by(warehouse_id=wh.id).order_by(Zone.code).all()
     return render_template(
@@ -501,6 +505,9 @@ def create_zone(warehouse_id):
     указано их количество) — коды ячеек присваиваются автоматически
     ("<ряд><NNNN>"), вручную придумывать и вводить их не нужно."""
     wh = Warehouse.query.get_or_404(warehouse_id)
+    if wh.is_recipient or wh.marketplace:
+        flash("Для склада-получателя ячейки не используются", "info")
+        return redirect(url_for("warehouses.list_warehouses"))
     code = request.form.get("code", "").strip()
     name = request.form.get("name", "").strip()
     cell_count = request.form.get("cell_count", type=int) or 0

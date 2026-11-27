@@ -43,6 +43,7 @@ def test_recipient_warehouses_import_creates_and_updates(db, client_logged_in):
     warehouse = Warehouse.query.filter_by(marketplace="wb", marketplace_city="Коледино").one()
     assert warehouse.address == "Адрес 1"
     assert warehouse.recipient_info == "ООО Получатель"
+    assert warehouse.is_recipient is True
 
     second = _xlsx([headers, [warehouse.code, "WB", "Коледино", "Адрес 2", "Новый получатель", "Нет"]])
     client_logged_in.post(

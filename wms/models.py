@@ -326,6 +326,9 @@ class Warehouse(db.Model):
     # получатель этого склада-направления. Настраивается отдельно для
     # каждого склада, в т.ч. складов-городов маркетплейсов.
     recipient_info = db.Column(db.String(300), nullable=True)
+    # Склад-получатель из Excel используется только как направление отгрузки:
+    # ряды и ячейки для него не ведутся.
+    is_recipient = db.Column(db.Boolean, nullable=False, default=False)
     # Название соответствующего склада в 1С (например "Товары в пути ФФ
     # КАЗАНЬ, Взлётная 30") — 1С не заводит отдельный физический склад под
     # каждый склад-город маркетплейса из WMS, а использует свой набор
@@ -792,6 +795,7 @@ class BoxPickingTask(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     number = db.Column(db.String(30), unique=True, nullable=False)
     title = db.Column(db.String(200), nullable=True)
+    marketplace_request_number = db.Column(db.String(50), nullable=True)
     warehouse_id = db.Column(db.Integer, db.ForeignKey("warehouses.id"), nullable=False)
     to_warehouse_id = db.Column(
         db.Integer, db.ForeignKey("warehouses.id"), nullable=True, index=True

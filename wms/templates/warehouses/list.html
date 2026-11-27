@@ -75,7 +75,7 @@
               {% endif %}
             </td>
             <td class="text-nowrap">
-              <a class="btn btn-sm btn-outline-primary" href="{{ url_for('warehouses.cells', warehouse_id=wh.id) }}">Ячейки</a>
+              {% if not wh.is_recipient and not wh.marketplace %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('warehouses.cells', warehouse_id=wh.id) }}">Ячейки</a>{% endif %}
               <form method="post" action="{{ url_for('warehouses.toggle_warehouse', warehouse_id=wh.id) }}" class="d-inline">
                 <button type="submit" class="btn btn-sm btn-outline-secondary">{{ 'Отключить' if wh.is_active else 'Включить' }}</button>
               </form>
@@ -97,7 +97,7 @@
         {% for wh in warehouses %}
           <div class="list-group-item py-2 px-2">
             <div class="d-flex justify-content-between align-items-center gap-2">
-              <a href="{{ url_for('warehouses.cells', warehouse_id=wh.id) }}" class="fw-bold text-decoration-none">{{ wh.code }} — {% if wh.marketplace %}{{ wh.marketplace_label() }} · {% endif %}{{ wh.name }}</a>
+              {% if wh.is_recipient or wh.marketplace %}<span class="fw-bold">{{ wh.code }} — {% if wh.marketplace %}{{ wh.marketplace_label() }} · {% endif %}{{ wh.name }}</span>{% else %}<a href="{{ url_for('warehouses.cells', warehouse_id=wh.id) }}" class="fw-bold text-decoration-none">{{ wh.code }} — {% if wh.marketplace %}{{ wh.marketplace_label() }} · {% endif %}{{ wh.name }}</a>{% endif %}
               {% if wh.is_active %}<span class="badge bg-success">Активен</span>{% else %}<span class="badge bg-secondary">Отключен</span>{% endif %}
             </div>
             {% if wh.address %}<div class="small text-muted">{{ wh.address }}</div>{% endif %}
@@ -136,6 +136,11 @@
 <div class="card p-3 mt-4">
   <h5>Кабинеты для коробов</h5>
   <p class="text-muted small">Префикс используется для новых коробов. Уже созданные номера при изменении настройки не меняются.</p>
+  <form method="post" action="{{ url_for('boxes.create_cabinet') }}" class="row g-2 align-items-end mb-3">
+    <div class="col-md-5"><label class="form-label">Название кабинета</label><input name="name" class="form-control" required placeholder="Например, Новый кабинет"></div>
+    <div class="col-md-3"><label class="form-label">Новый префикс</label><input name="prefix" class="form-control text-uppercase" maxlength="10" pattern="[A-Za-zА-Яа-я0-9]+" required placeholder="Например, C"></div>
+    <div class="col-md-4"><button class="btn btn-primary" type="submit">Добавить префикс</button></div>
+  </form>
   <div class="table-responsive">
     <table class="table table-sm mb-0">
       <thead><tr><th>Название</th><th>Префикс</th><th>Активен</th><th></th></tr></thead>

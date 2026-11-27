@@ -17,11 +17,12 @@
 
 <div class="table-responsive">
 <table class="table table-hover align-middle">
-  <thead><tr><th>Номер</th><th>Задание</th><th>Маршрут</th><th>Исполнитель</th><th>Прогресс</th><th>Статус</th><th>Создано</th></tr></thead>
+  <thead><tr><th>Номер</th><th>Заявка на МП</th><th>Задание</th><th>Маршрут</th><th>Исполнитель</th><th>Прогресс</th><th>Статус</th><th>Создано</th></tr></thead>
   <tbody>
   {% for task in tasks %}
     <tr>
       <td><a href="{{ url_for('box_picking.detail', task_id=task.id) }}" class="fw-semibold">{{ task.number }}</a></td>
+      <td>{{ task.marketplace_request_number or '—' }}</td>
       <td>{{ task.title or 'Подбор коробов' }}</td>
       <td>{{ task.warehouse.name }} → {{ task.to_warehouse.name if task.to_warehouse else 'не выбран' }}</td>
       <td>{{ task.assigned_to.display_name() if task.assigned_to else 'Не назначен' }}</td>
@@ -30,7 +31,7 @@
       <td>{{ task.created_at.strftime('%d.%m.%Y %H:%M') }}</td>
     </tr>
   {% else %}
-    <tr><td colspan="7" class="text-center text-muted py-4">Заданий нет</td></tr>
+    <tr><td colspan="8" class="text-center text-muted py-4">Заданий нет</td></tr>
   {% endfor %}
   </tbody>
 </table>

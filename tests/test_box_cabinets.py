@@ -89,3 +89,15 @@ def test_inactive_cabinet_cannot_be_used_for_new_boxes(db, client_logged_in):
 
     assert "Выберите активный кабинет" in response.get_data(as_text=True)
     assert Box.query.filter_by(warehouse_id=warehouse.id).count() == 0
+
+
+def test_admin_can_add_new_box_prefix(db, client_logged_in):
+    response = client_logged_in.post(
+        "/boxes/cabinets/create",
+        data={"name": "Пятый кабинет", "prefix": "C5"},
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    cabinet = BoxCabinet.query.filter_by(prefix="C5").one()
+    assert cabinet.name == "Пятый кабинет"
+    assert cabinet.is_active is True

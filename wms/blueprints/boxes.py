@@ -290,3 +290,21 @@ def update_cabinet(cabinet_id):
     db.session.commit()
     flash(f"Кабинет «{name}» сохранен", "success")
     return redirect(url_for("warehouses.list_warehouses"))
+
+
+@bp.route("/cabinets/create", methods=["POST"])
+def create_cabinet():
+    if not current_user.is_admin:
+        abort(403)
+    name = request.form.get("name", "").strip()
+    prefix = request.form.get("prefix", "").strip().upper()
+    if not name or not prefix or len(prefix) > 10 or not prefix.isalnum():
+        flash("Укажите название и префикс до 10 букв/цифр", "danger")
+        return redirect(url_for("warehouses.list_warehouses"))
+    if BoxCabinet.query.filter_by(prefix=prefix).first():
+        flash(f"Префикс {prefix} уже используется", "danger")
+        return redirect(url_for("warehouses.list_warehouses"))
+    db.session.add(BoxCabinet(name=name, prefix=prefix, is_active=True))
+    db.session.commit()
+    flash(f"Префикс {prefix} добавлен", "success")
+    return redirect(url_for("warehouses.list_warehouses"))
