@@ -1,9 +1,14 @@
-from flask import Blueprint, flash, redirect, render_template, request, url_for
+from flask import Blueprint, Response, flash, redirect, render_template, request, url_for
 from flask_login import current_user
 
 from ..extensions import db
 from ..models import Box, BoxCabinet, Cell, ShipmentPlanLine, UnplacedStock, Warehouse, Zone
+from ..utils.http import content_disposition
 from ..utils.numbering import next_number
+from ..utils.operational_excel import (
+    build_recipient_warehouses_template,
+    read_recipient_warehouses,
+)
 from ..utils.shipment_plan_import import canonical_marketplace_city
 
 bp = Blueprint("warehouses", __name__)
@@ -289,6 +294,117 @@ def create_warehouse():
     return redirect(url_for("warehouses.list_warehouses"))
 
 
+@bp.route("/recipients-template.xlsx")
+def recipients_template():
+    data = build_recipient_warehouses_template()
+    return Response(
+        data,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": content_disposition(
+                "recipient_warehouses_template.xlsx"
+            )
+        },
+    )
+
+
+def _warehouse_type(raw):
+    value = (raw or "").strip().casefold()
+    aliases = {
+        "own": None,
+        "собственный": None,
+        "свой": None,
+        "wb": "wb",
+        "вб": "wb",
+        "wildberries": "wb",
+        "ozon": "ozon",
+        "озон": "ozon",
+    }
+    return aliases.get(value, "invalid")
+
+
+def _active_value(raw):
+    value = (raw or "").strip().casefold()
+    if value in {"", "да", "yes", "1", "true", "активен"}:
+        return True
+    if value in {"нет", "no", "0", "false", "отключен"}:
+        return False
+    return None
+
+
+@bp.route("/recipients-import", methods=["POST"])
+def import_recipients():
+    if not current_user.is_admin:
+        flash("Загружать склады может только администратор", "danger")
+        return redirect(url_for("warehouses.list_warehouses"))
+    upload = request.files.get("file")
+    if not upload or not upload.filename:
+        flash("Выберите Excel-файл", "danger")
+        return redirect(url_for("warehouses.list_warehouses"))
+
+    records, errors = read_recipient_warehouses(upload.stream)
+    created = updated = 0
+    for record in records:
+        marketplace = _warehouse_type(record["type"])
+        active = _active_value(record["active"])
+        if marketplace == "invalid":
+            errors.append(f"Строка {record['row']}: неизвестный тип «{record['type']}»")
+            continue
+        if not record["name"]:
+            errors.append(f"Строка {record['row']}: не заполнено наименование")
+            continue
+        if active is None:
+            errors.append(f"Строка {record['row']}: в колонке «Активен» укажите Да или Нет")
+            continue
+
+        warehouse = None
+        if record["code"]:
+            warehouse = Warehouse.query.filter_by(code=record["code"]).first()
+        city = canonical_marketplace_city(record["name"]) if marketplace else None
+        if warehouse is None and marketplace:
+            warehouse = next(
+                (
+                    item
+                    for item in Warehouse.query.filter_by(marketplace=marketplace).all()
+                    if canonical_marketplace_city(item.marketplace_city or item.name).casefold()
+                    == city.casefold()
+                ),
+                None,
+            )
+        if warehouse is None and marketplace is None:
+            warehouse = Warehouse.query.filter(
+                Warehouse.marketplace.is_(None), Warehouse.name == record["name"]
+            ).first()
+
+        if warehouse is None:
+            code = record["code"] or next_number("warehouse")
+            if Warehouse.query.filter_by(code=code).first():
+                errors.append(f"Строка {record['row']}: код «{code}» уже используется")
+                continue
+            warehouse = Warehouse(code=code)
+            db.session.add(warehouse)
+            created += 1
+        else:
+            updated += 1
+
+        warehouse.name = city if marketplace else record["name"]
+        warehouse.address = record["address"] or None
+        warehouse.recipient_info = record["recipient_info"] or None
+        warehouse.is_active = active
+        warehouse.marketplace = marketplace
+        warehouse.marketplace_city = city
+        if marketplace and not warehouse.fulfillment_1c_name:
+            warehouse.fulfillment_1c_name = default_fulfillment_1c_name(city)
+
+    db.session.commit()
+    flash(f"Склады загружены: создано {created}, обновлено {updated}", "success")
+    for error in errors[:10]:
+        flash(error, "warning")
+    if len(errors) > 10:
+        flash(f"И ещё ошибок: {len(errors) - 10}", "warning")
+    return redirect(url_for("warehouses.list_warehouses"))
+
+
 @bp.route("/<int:warehouse_id>/toggle", methods=["POST"])
 def toggle_warehouse(warehouse_id):
     wh = Warehouse.query.get_or_404(warehouse_id)
@@ -299,24 +415,12 @@ def toggle_warehouse(warehouse_id):
 
 @bp.route("/<int:warehouse_id>/delete", methods=["POST"])
 def delete_warehouse(warehouse_id):
-    """Удаляет лишнее направление, созданное ошибочным импортом плана.
-
-    Обычные физические склады и склады с любыми операционными данными не
-    удаляются. Это сохраняет историю учёта; для них остаётся безопасное
-    действие «Отключить».
-    """
+    """Удаляет любой неиспользуемый склад; историю операций не разрушает."""
     if not current_user.is_admin:
         flash("Удалять склады может только администратор", "danger")
         return redirect(url_for("warehouses.list_warehouses"))
 
     wh = Warehouse.query.get_or_404(warehouse_id)
-    if not wh.marketplace:
-        flash(
-            "Обычный склад нельзя удалить. Если он больше не используется, отключите его.",
-            "danger",
-        )
-        return redirect(url_for("warehouses.list_warehouses"))
-
     usage = _warehouse_blocking_usage(wh.id)
     if usage:
         details = ", ".join(f"{label}: {count}" for label, count in usage.items())
@@ -330,11 +434,11 @@ def delete_warehouse(warehouse_id):
     plan_line_count = ShipmentPlanLine.query.filter_by(warehouse_id=wh.id).delete(
         synchronize_session=False
     )
-    display_name = f"{wh.marketplace_label()} · {wh.name}"
+    display_name = f"{wh.marketplace_label()} · {wh.name}" if wh.marketplace else wh.name
     db.session.delete(wh)
     db.session.commit()
     suffix = f" Строк плана удалено: {plan_line_count}." if plan_line_count else ""
-    flash(f"Лишний склад «{display_name}» удалён.{suffix}", "success")
+    flash(f"Склад «{display_name}» удалён.{suffix}", "success")
     return redirect(url_for("warehouses.list_warehouses"))
 
 

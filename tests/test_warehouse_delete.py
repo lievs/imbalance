@@ -42,7 +42,7 @@ def test_admin_can_delete_imported_warehouse_and_its_plan_lines(db, client_logge
     assert response.status_code == 200
     assert Warehouse.query.get(warehouse.id) is None
     assert ShipmentPlanLine.query.filter_by(warehouse_id=warehouse.id).count() == 0
-    assert "Лишний склад" in response.get_data(as_text=True)
+    assert "Склад «ОЗОН · Ошибочный город» удалён" in response.get_data(as_text=True)
 
 
 def test_imported_warehouse_with_operational_data_cannot_be_deleted(db, client_logged_in):
@@ -63,7 +63,7 @@ def test_imported_warehouse_with_operational_data_cannot_be_deleted(db, client_l
     assert "короба: 1" in html
 
 
-def test_regular_warehouse_cannot_be_deleted(db, client_logged_in):
+def test_regular_unused_warehouse_can_be_deleted(db, client_logged_in):
     warehouse = Warehouse(code="WH-DELETE-REG", name="Обычный склад")
     db.session.add(warehouse)
     db.session.commit()
@@ -73,8 +73,8 @@ def test_regular_warehouse_cannot_be_deleted(db, client_logged_in):
     )
 
     assert response.status_code == 200
-    assert Warehouse.query.get(warehouse.id) is not None
-    assert "Обычный склад нельзя удалить" in response.get_data(as_text=True)
+    assert Warehouse.query.get(warehouse.id) is None
+    assert "Склад «Обычный склад» удалён" in response.get_data(as_text=True)
 
 
 def test_non_admin_cannot_delete_imported_warehouse(db, client):

@@ -37,6 +37,18 @@
         </div>
         <button type="submit" class="btn btn-primary">Создать</button>
       </form>
+      {% if current_user.is_admin %}
+      <hr>
+      <h6>Загрузить склады-получатели</h6>
+      <p class="text-muted small mb-2">Повторная загрузка обновляет склад по коду или по названию и типу.</p>
+      <form method="post" action="{{ url_for('warehouses.import_recipients') }}" enctype="multipart/form-data">
+        <input type="file" name="file" class="form-control form-control-sm mb-2" accept=".xlsx" required>
+        <div class="d-flex gap-2">
+          <button type="submit" class="btn btn-sm btn-outline-primary">Загрузить Excel</button>
+          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('warehouses.recipients_template') }}">Скачать шаблон</a>
+        </div>
+      </form>
+      {% endif %}
     </div>
   </div>
   <div class="col-md-7">
@@ -67,9 +79,9 @@
               <form method="post" action="{{ url_for('warehouses.toggle_warehouse', warehouse_id=wh.id) }}" class="d-inline">
                 <button type="submit" class="btn btn-sm btn-outline-secondary">{{ 'Отключить' if wh.is_active else 'Включить' }}</button>
               </form>
-              {% if current_user.is_admin and wh.marketplace %}
+              {% if current_user.is_admin %}
               <form method="post" action="{{ url_for('warehouses.delete_warehouse', warehouse_id=wh.id) }}" class="d-inline"
-                    onsubmit="return confirm('Удалить склад «{{ wh.marketplace_label() }} · {{ wh.name }}» и его строки плана? Действие нельзя отменить.')">
+                    onsubmit="return confirm('Удалить склад «{{ wh.name }}»? Склад с операционными данными удалить нельзя.')">
                 <button type="submit" class="btn btn-sm btn-outline-danger">Удалить</button>
               </form>
               {% endif %}
@@ -103,9 +115,9 @@
                 <form method="post" action="{{ url_for('warehouses.toggle_warehouse', warehouse_id=wh.id) }}">
                   <button type="submit" class="btn btn-sm btn-outline-secondary">{{ 'Отключить' if wh.is_active else 'Включить' }}</button>
                 </form>
-                {% if current_user.is_admin and wh.marketplace %}
+                {% if current_user.is_admin %}
                 <form method="post" action="{{ url_for('warehouses.delete_warehouse', warehouse_id=wh.id) }}"
-                      onsubmit="return confirm('Удалить склад «{{ wh.marketplace_label() }} · {{ wh.name }}» и его строки плана? Действие нельзя отменить.')">
+                      onsubmit="return confirm('Удалить склад «{{ wh.name }}»? Склад с операционными данными удалить нельзя.')">
                   <button type="submit" class="btn btn-sm btn-outline-danger">Удалить</button>
                 </form>
                 {% endif %}

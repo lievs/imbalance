@@ -4,11 +4,13 @@ from wms.extensions import db
 from wms.models import (
     Box,
     BoxCabinet,
+    BoxItem,
     BoxPickingTask,
     BoxPickingTaskLine,
     Cell,
     MovementDocument,
     MovementLine,
+    Nomenclature,
     Warehouse,
     Zone,
 )
@@ -29,6 +31,10 @@ def _warehouse_with_boxes():
         Box(box_number="BOX-800002", warehouse=warehouse, zone_id=zone.id, status="stored"),
     ]
     db.session.add_all(boxes)
+    item = Nomenclature(sku="PICK-SKU", barcode="PICK-BARCODE", name="Товар для подбора")
+    db.session.add(item)
+    db.session.flush()
+    db.session.add_all([BoxItem(box=box, nomenclature=item, qty=1) for box in boxes])
     db.session.commit()
     return warehouse, boxes
 
@@ -109,10 +115,12 @@ def test_numeric_box_code_is_resolved_inside_task_warehouse(client_logged_in, ap
         target_cabinet = BoxCabinet(name="Нужный кабинет", prefix="PT")
         db.session.add_all([first, target, first_cabinet, target_cabinet])
         db.session.flush()
-        db.session.add_all([
-            Box(box_number="PF-000777", warehouse=first, cabinet=first_cabinet),
-            Box(box_number="PT-000777", warehouse=target, cabinet=target_cabinet),
-        ])
+        first_box = Box(box_number="PF-000777", warehouse=first, cabinet=first_cabinet)
+        target_box = Box(box_number="PT-000777", warehouse=target, cabinet=target_cabinet)
+        item = Nomenclature(sku="PICK-NUM", barcode="PICK-NUM-BAR", name="Товар")
+        db.session.add_all([first_box, target_box, item])
+        db.session.flush()
+        db.session.add(BoxItem(box=target_box, nomenclature=item, qty=1))
         db.session.commit()
         target_id = target.id
 
@@ -210,6 +218,55 @@ def test_finish_picking_creates_one_movement_document(client_logged_in, app):
         assert MovementDocument.query.count() == 1
         assert MovementLine.query.count() == 2
 
+
+def test_empty_box_cannot_be_added_to_task(client_logged_in, app):
+    with app.app_context():
+        warehouse = Warehouse(code="PICK-EMPTY-WH", name="Склад пустых коробов")
+        box = Box(box_number="BOX-EMPTY-PICK", warehouse=warehouse)
+        db.session.add_all([warehouse, box])
+        db.session.commit()
+        warehouse_id = warehouse.id
+
+    response = client_logged_in.post(
+        "/box-picking/create",
+        data={"warehouse_id": warehouse_id, "box_codes": "BOX-EMPTY-PICK"},
+        follow_redirects=True,
+    )
+    assert "пустой — его нельзя добавить" in response.get_data(as_text=True)
+    with app.app_context():
+        assert BoxPickingTask.query.one().total_count() == 0
+
+
+def test_task_can_be_loaded_from_excel_template(client_logged_in, app):
+    import io
+    from openpyxl import Workbook
+
+    with app.app_context():
+        warehouse, boxes = _warehouse_with_boxes()
+        warehouse_id = warehouse.id
+        box_numbers = [box.box_number for box in boxes]
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Номер короба"])
+    for number in box_numbers:
+        sheet.append([number])
+    data = io.BytesIO()
+    workbook.save(data)
+    data.seek(0)
+
+    response = client_logged_in.post(
+        "/box-picking/create",
+        data={
+            "warehouse_id": warehouse_id,
+            "file": (data, "picking.xlsx"),
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    with app.app_context():
+        assert BoxPickingTask.query.one().total_count() == 2
 
 
 def test_removed_modules_are_not_registered_and_not_in_menu(client_logged_in, app):

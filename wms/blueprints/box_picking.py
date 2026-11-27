@@ -1,12 +1,13 @@
 import re
 from datetime import datetime
 
-from flask import Blueprint, flash, redirect, render_template, request, url_for
+from flask import Blueprint, Response, flash, redirect, render_template, request, url_for
 from flask_login import current_user
 
 from ..extensions import db
 from ..models import (
     Box,
+    BoxItem,
     BoxPickingTask,
     BoxPickingTaskLine,
     MovementDocument,
@@ -15,7 +16,9 @@ from ..models import (
     User,
     Warehouse,
 )
+from ..utils.http import content_disposition
 from ..utils.numbering import next_number
+from ..utils.operational_excel import build_box_picking_template, read_box_codes
 
 
 bp = Blueprint("box_picking", __name__)
@@ -42,6 +45,15 @@ def _codes(raw):
     return [value for value in re.split(r"[\s,;]+", (raw or "").strip()) if value]
 
 
+def _box_has_items(box_id):
+    return (
+        db.session.query(BoxItem.id)
+        .filter(BoxItem.box_id == box_id, BoxItem.qty > 0)
+        .first()
+        is not None
+    )
+
+
 def _add_codes(task, raw):
     added = 0
     errors = []
@@ -54,12 +66,40 @@ def _add_codes(task, raw):
         if box is None:
             errors.append(f"Короб {code} не найден")
             continue
+        if box.warehouse_id != task.warehouse_id:
+            errors.append(
+                f"Короб {box.box_number} находится на складе «{box.warehouse.name}»"
+            )
+            continue
+        if not _box_has_items(box.id):
+            errors.append(f"Короб {box.box_number} пустой — его нельзя добавить в задание")
+            continue
         if box.id in existing_ids:
             continue
         db.session.add(BoxPickingTaskLine(task=task, box=box))
         existing_ids.add(box.id)
         added += 1
     return added, errors
+
+
+def _codes_from_request():
+    codes = _codes(request.form.get("box_codes", ""))
+    upload = request.files.get("file")
+    if upload and upload.filename:
+        file_codes, errors = read_box_codes(upload.stream)
+        if errors:
+            return codes, errors
+        codes.extend(code for code in file_codes if code not in codes)
+    return codes, []
+
+
+@bp.route("/template.xlsx")
+def template():
+    return Response(
+        build_box_picking_template(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": content_disposition("box_picking_template.xlsx")},
+    )
 
 
 @bp.route("/")
@@ -102,6 +142,11 @@ def create_task():
 
     assigned_to_id = request.form.get("assigned_to_id", type=int)
     assigned_to = User.query.filter_by(id=assigned_to_id, is_active_user=True).first() if assigned_to_id else None
+    codes, file_errors = _codes_from_request()
+    if file_errors:
+        for error in file_errors:
+            flash(error, "danger")
+        return render_template("box_picking/create.html", warehouses=warehouses, users=users)
     task = BoxPickingTask(
         number=next_number("box_picking"),
         title=request.form.get("title", "").strip() or None,
@@ -112,7 +157,7 @@ def create_task():
     )
     db.session.add(task)
     db.session.flush()
-    added, errors = _add_codes(task, request.form.get("box_codes", ""))
+    added, errors = _add_codes(task, "\n".join(codes))
     db.session.commit()
     flash(f"Задание {task.number} создано, добавлено коробов: {added}", "success")
     for error in errors[:10]:
@@ -168,12 +213,16 @@ def add_selected_boxes():
     existing_ids = {line.box_id for line in task.lines.all()}
     added = 0
     wrong_warehouse = []
+    empty_boxes = []
     for box_id in box_ids:
         box = boxes_by_id.get(box_id)
         if box is None or box.id in existing_ids:
             continue
         if box.warehouse_id != task.warehouse_id:
             wrong_warehouse.append(box.box_number)
+            continue
+        if not _box_has_items(box.id):
+            empty_boxes.append(box.box_number)
             continue
         db.session.add(BoxPickingTaskLine(task=task, box=box))
         existing_ids.add(box.id)
@@ -189,6 +238,11 @@ def add_selected_boxes():
         suffix = f" и ещё {len(wrong_warehouse) - 10}" if len(wrong_warehouse) > 10 else ""
         flash(
             f"Не добавлены короба с другого склада: {preview}{suffix}",
+            "warning",
+        )
+    if empty_boxes:
+        flash(
+            "Пустые короба не добавлены: " + ", ".join(empty_boxes[:10]),
             "warning",
         )
     return redirect(url_for("box_picking.detail", task_id=task.id))
@@ -207,6 +261,14 @@ def create_from_selected_boxes():
     boxes = [boxes_by_id[box_id] for box_id in box_ids if box_id in boxes_by_id]
     if not boxes:
         flash("Выбранные короба не найдены", "danger")
+        return redirect(_selected_boxes_return_url())
+
+    empty_boxes = [box.box_number for box in boxes if not _box_has_items(box.id)]
+    boxes = [box for box in boxes if _box_has_items(box.id)]
+    if empty_boxes:
+        flash("Пустые короба не добавлены: " + ", ".join(empty_boxes[:10]), "warning")
+    if not boxes:
+        flash("В выбранных коробах нет товара", "danger")
         return redirect(_selected_boxes_return_url())
 
     warehouse_ids = {box.warehouse_id for box in boxes}
@@ -267,7 +329,9 @@ def add_boxes(task_id):
     if task.status == "completed":
         flash("Выполненное задание сначала нужно открыть заново", "warning")
         return redirect(url_for("box_picking.detail", task_id=task.id))
-    added, errors = _add_codes(task, request.form.get("box_codes", ""))
+    codes, file_errors = _codes_from_request()
+    added, errors = _add_codes(task, "\n".join(codes))
+    errors = file_errors + errors
     db.session.commit()
     if added:
         flash(f"Добавлено коробов: {added}", "success")

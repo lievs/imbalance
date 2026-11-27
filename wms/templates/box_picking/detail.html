@@ -87,11 +87,15 @@
 </div>
 
 {% if task.status != 'completed' %}
-<form method="post" action="{{ url_for('box_picking.add_boxes', task_id=task.id) }}" class="card p-3 mt-3">
+<form method="post" enctype="multipart/form-data" action="{{ url_for('box_picking.add_boxes', task_id=task.id) }}" class="card p-3 mt-3">
   <label class="form-label fw-semibold">Добавить короба в задание</label>
   <div class="input-group">
-    <textarea name="box_codes" class="form-control" rows="2" placeholder="Номера через пробел, запятую или с новой строки" required></textarea>
+    <textarea name="box_codes" class="form-control" rows="2" placeholder="Номера через пробел, запятую или с новой строки"></textarea>
     <button class="btn btn-outline-primary">Добавить</button>
+  </div>
+  <div class="mt-2 d-flex align-items-center gap-2 flex-wrap">
+    <input type="file" name="file" class="form-control form-control-sm" accept=".xlsx" style="max-width:360px">
+    <a class="small" href="{{ url_for('box_picking.template') }}">Скачать Excel-шаблон</a>
   </div>
 </form>
 {% endif %}
